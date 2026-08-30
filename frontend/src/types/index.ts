@@ -243,10 +243,10 @@ export const CLASS_TYPES = {
 } as const;
 
 export const BOOKING_STATUS = {
-  waiting: '等待開票',
-  pending: '等待中',
-  running: '執行中',
-  pausing: '暫停中',
+  waiting: '尚未開票',
+  pending: '等待下次執行',
+  running: '正在執行',
+  pausing: '本次完成後暫停',
   paused: '已暫停',
   success: '成功',
   failed: '失敗',

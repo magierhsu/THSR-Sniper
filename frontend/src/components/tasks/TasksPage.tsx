@@ -402,7 +402,7 @@ const TasksPage: React.FC = () => {
 
                     {task.last_attempt && (
                       <p className="text-text-muted text-sm">
-                        最後嘗試：{formatDateTimeWithTimezone(task.last_attempt)}
+                        上次實際執行：{formatDateTimeWithTimezone(task.last_attempt)}
                       </p>
                     )}
                   </div>
