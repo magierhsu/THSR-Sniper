@@ -6,14 +6,25 @@ from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator, model_validator
+from pydantic import BaseModel, Field, field_validator, validator, model_validator
 import uvicorn
 
 from .scheduler import (
-    BookingTask, BookingStatus, 
-    get_scheduler, create_booking_task
+    BookingTask,
+    BookingStatus,
+    TaskNotFoundError,
+    TaskOwnershipError,
+    TaskStateError,
+    get_scheduler,
+    create_booking_task,
 )
-from .schema import MAX_DEPARTURE_TIME_RANGE_MINUTES, STATION_MAP, TIME_TABLE
+from .schema import (
+    MAX_DEPARTURE_TIME_RANGE_MINUTES,
+    MAX_PREFERRED_TRAIN_NUMBERS,
+    STATION_MAP,
+    TIME_TABLE,
+    normalize_preferred_train_numbers,
+)
 from .flows import run as run_booking_flow
 
 # Utility function to clean ANSI color codes
@@ -76,6 +87,11 @@ class BookingRequest(BaseModel):
         description="Accepted departure range after query time, in minutes",
     )
     train_index: Optional[int] = Field(None, ge=1, description="Train selection index")
+    preferred_train_numbers: List[str] = Field(
+        default_factory=list,
+        max_length=MAX_PREFERRED_TRAIN_NUMBERS,
+        description="Preferred train numbers in priority order",
+    )
     seat_prefer: Optional[int] = Field(None, ge=0, le=2, description="Seat preference: 0=any, 1=window, 2=aisle")
     class_type: Optional[int] = Field(None, ge=0, le=1, description="Class type: 0=standard, 1=business")
     no_ocr: bool = Field(False, description="Disable automatic captcha OCR recognition (default: False to enable OCR)")
@@ -98,6 +114,19 @@ class BookingRequest(BaseModel):
         if len(v) != 10:
             raise ValueError("Personal ID must be 10 characters long")
         return v
+
+    @field_validator("preferred_train_numbers", mode="before")
+    @classmethod
+    def validate_preferred_train_numbers(cls, value):
+        if value is None:
+            return []
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("preferred_train_numbers must be an array")
+        if len(value) > MAX_PREFERRED_TRAIN_NUMBERS:
+            raise ValueError(
+                f"At most {MAX_PREFERRED_TRAIN_NUMBERS} preferred trains are allowed"
+            )
+        return normalize_preferred_train_numbers(value)
     
     @model_validator(mode='after')
     def validate_ticket_counts(self):
@@ -115,6 +144,11 @@ class BookingRequest(BaseModel):
         
         if total_tickets > 10:
             raise ValueError("Total tickets cannot exceed 10")
+
+        if self.train_index is not None and self.preferred_train_numbers:
+            raise ValueError(
+                "train_index and preferred_train_numbers cannot be used together"
+            )
         
         return self
 
@@ -122,6 +156,10 @@ class BookingRequest(BaseModel):
 class ScheduledBookingRequest(BookingRequest):
     interval_minutes: int = Field(5, ge=1, description="Booking attempt interval in minutes")
     max_attempts: Optional[int] = Field(None, ge=1, description="Maximum number of attempts (unlimited if null)")
+
+
+class TaskUpdateRequest(ScheduledBookingRequest):
+    pass
 
 
 class BookingResponse(BaseModel):
@@ -145,12 +183,46 @@ class TaskStatusResponse(BaseModel):
     time: Optional[int] = None
     time_range_minutes: int = 30
     train_index: Optional[int] = None
+    preferred_train_numbers: List[str] = Field(default_factory=list)
+    seat_prefer: Optional[int] = None
+    class_type: Optional[int] = None
+    no_ocr: bool = False
     interval_minutes: int
+    max_attempts: Optional[int] = None
     attempts: int
     last_attempt: Optional[str]
     success_pnr: Optional[str]
     error_message: Optional[str]
     created_at: str
+
+
+def _task_to_status_response(task: BookingTask) -> TaskStatusResponse:
+    return TaskStatusResponse(
+        id=task.id,
+        status=task.status.value,
+        from_station=task.from_station,
+        to_station=task.to_station,
+        date=task.date,
+        adult_cnt=task.adult_cnt,
+        student_cnt=task.student_cnt,
+        child_cnt=task.child_cnt,
+        senior_cnt=task.senior_cnt,
+        disabled_cnt=task.disabled_cnt,
+        time=task.time,
+        time_range_minutes=task.time_range_minutes,
+        train_index=task.train_index,
+        preferred_train_numbers=task.preferred_train_numbers,
+        seat_prefer=task.seat_prefer,
+        class_type=task.class_type,
+        no_ocr=task.no_ocr,
+        interval_minutes=task.interval_minutes,
+        max_attempts=task.max_attempts,
+        attempts=task.attempts,
+        last_attempt=task.last_attempt.isoformat() if task.last_attempt else None,
+        success_pnr=clean_ansi_codes(task.success_pnr),
+        error_message=task.error_message,
+        created_at=task.created_at.isoformat(),
+    )
 
 
 class StationInfo(BaseModel):
@@ -257,6 +329,7 @@ async def immediate_booking(request: BookingRequest):
             time=request.time,
             time_range_minutes=request.time_range_minutes,
             train_index=request.train_index,
+            preferred_train_numbers=request.preferred_train_numbers,
             seat_prefer=request.seat_prefer,
             class_type=request.class_type,
             no_ocr=request.no_ocr,
@@ -351,6 +424,7 @@ async def schedule_booking(
             time=request.time,
             time_range_minutes=request.time_range_minutes,
             train_index=request.train_index,
+            preferred_train_numbers=request.preferred_train_numbers,
             seat_prefer=request.seat_prefer,
             class_type=request.class_type,
             no_ocr=request.no_ocr
@@ -384,30 +458,7 @@ async def list_tasks(current_user_id: Optional[str] = Depends(get_current_user))
     if current_user_id != "cli-internal":
         tasks = [task for task in tasks if task.user_id == current_user_id]
     
-    return [
-        TaskStatusResponse(
-            id=task.id,
-            status=task.status.value,
-            from_station=task.from_station,
-            to_station=task.to_station,
-            date=task.date,
-            adult_cnt=task.adult_cnt,
-            student_cnt=task.student_cnt,
-            child_cnt=task.child_cnt,
-            senior_cnt=task.senior_cnt,
-            disabled_cnt=task.disabled_cnt,
-            time=task.time,
-            time_range_minutes=task.time_range_minutes,
-            train_index=task.train_index,
-            interval_minutes=task.interval_minutes,
-            attempts=task.attempts,
-            last_attempt=task.last_attempt.isoformat() if task.last_attempt else None,
-            success_pnr=clean_ansi_codes(task.success_pnr),
-            error_message=task.error_message,
-            created_at=task.created_at.isoformat()
-        )
-        for task in tasks
-    ]
+    return [_task_to_status_response(task) for task in tasks]
 
 
 @app.get("/tasks/{task_id}", response_model=TaskStatusResponse)
@@ -430,27 +481,94 @@ async def get_task_status(
     if current_user_id != "cli-internal" and task.user_id != current_user_id:
         raise HTTPException(status_code=403, detail="Access denied: You can only view your own tasks")
     
-    return TaskStatusResponse(
-        id=task.id,
-        status=task.status.value,
-        from_station=task.from_station,
-        to_station=task.to_station,
-        date=task.date,
-        adult_cnt=task.adult_cnt,
-        student_cnt=task.student_cnt,
-        child_cnt=task.child_cnt,
-        senior_cnt=task.senior_cnt,
-        disabled_cnt=task.disabled_cnt,
-        time=task.time,
-        time_range_minutes=task.time_range_minutes,
-        train_index=task.train_index,
-        interval_minutes=task.interval_minutes,
-        attempts=task.attempts,
-        last_attempt=task.last_attempt.isoformat() if task.last_attempt else None,
-        success_pnr=clean_ansi_codes(task.success_pnr),
-        error_message=task.error_message,
-        created_at=task.created_at.isoformat()
-    )
+    return _task_to_status_response(task)
+
+
+def _task_user_check_id(current_user_id: str) -> Optional[str]:
+    return None if current_user_id == "cli-internal" else current_user_id
+
+
+def _raise_task_operation_error(exc: Exception) -> None:
+    if isinstance(exc, TaskNotFoundError):
+        raise HTTPException(status_code=404, detail="Task not found") from exc
+    if isinstance(exc, TaskOwnershipError):
+        raise HTTPException(status_code=403, detail="Access denied") from exc
+    if isinstance(exc, TaskStateError):
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    raise exc
+
+
+@app.post("/tasks/{task_id}/pause", response_model=TaskStatusResponse)
+async def pause_task(
+    task_id: str,
+    current_user_id: Optional[str] = Depends(get_current_user),
+):
+    if not current_user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        task = get_scheduler().pause_task(
+            task_id, _task_user_check_id(current_user_id)
+        )
+        return _task_to_status_response(task)
+    except (TaskNotFoundError, TaskOwnershipError, TaskStateError) as exc:
+        _raise_task_operation_error(exc)
+
+
+@app.post("/tasks/{task_id}/resume", response_model=TaskStatusResponse)
+async def resume_task(
+    task_id: str,
+    current_user_id: Optional[str] = Depends(get_current_user),
+):
+    if not current_user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        task = get_scheduler().resume_task(
+            task_id, _task_user_check_id(current_user_id)
+        )
+        return _task_to_status_response(task)
+    except (TaskNotFoundError, TaskOwnershipError, TaskStateError) as exc:
+        _raise_task_operation_error(exc)
+
+
+@app.put("/tasks/{task_id}", response_model=TaskStatusResponse)
+async def update_task(
+    task_id: str,
+    request: TaskUpdateRequest,
+    current_user_id: Optional[str] = Depends(get_current_user),
+):
+    if not current_user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    try:
+        replacement = create_booking_task(
+            from_station=request.from_station,
+            to_station=request.to_station,
+            date=request.date,
+            personal_id=request.personal_id,
+            use_membership=request.use_membership,
+            adult_cnt=request.adult_cnt,
+            student_cnt=request.student_cnt,
+            child_cnt=request.child_cnt,
+            senior_cnt=request.senior_cnt,
+            disabled_cnt=request.disabled_cnt,
+            time=request.time,
+            time_range_minutes=request.time_range_minutes,
+            train_index=request.train_index,
+            preferred_train_numbers=request.preferred_train_numbers,
+            seat_prefer=request.seat_prefer,
+            class_type=request.class_type,
+            no_ocr=request.no_ocr,
+            interval_minutes=request.interval_minutes,
+            max_attempts=request.max_attempts,
+        )
+        task = get_scheduler().update_task(
+            task_id, replacement, _task_user_check_id(current_user_id)
+        )
+        return _task_to_status_response(task)
+    except (TaskNotFoundError, TaskOwnershipError, TaskStateError) as exc:
+        _raise_task_operation_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.delete("/tasks/{task_id}", response_model=BookingResponse)
@@ -569,12 +687,14 @@ def _booking_task_to_result(task: BookingTask) -> Dict[str, object]:
         "last_attempt": task.last_attempt.isoformat() if task.last_attempt else None,
         "time": task.time,
         "time_range_minutes": task.time_range_minutes,
+        "train_index": task.train_index,
+        "preferred_train_numbers": list(task.preferred_train_numbers),
         "seat_prefer": task.seat_prefer,
         "class_type": task.class_type,
         "no_ocr": task.no_ocr,
         "result": getattr(task, "result", None),
         "success_pnr": getattr(task, "success_pnr", None),
-        "error": getattr(task, "error", None),
+        "error": task.error_message,
     }
 
 @app.get("/health/thsr")
@@ -661,6 +781,8 @@ async def test_thsr_connectivity():
         
         return result
             
+    except HTTPException:
+        raise
     except Exception as e:
         error_result = {
             "status": "error",
@@ -674,7 +796,13 @@ async def test_thsr_connectivity():
 
 @app.get("/results")
 async def get_results(
-    status: Optional[str] = Query(None, description="Filter by status (pending/running/success/failed/cancelled/expired)"),
+    status: Optional[str] = Query(
+        None,
+        description=(
+            "Filter by status (pending/waiting/running/pausing/paused/"
+            "success/failed/cancelled/expired)"
+        ),
+    ),
     limit: int = Query(50, ge=1, le=1000, description="Maximum number of results"),
     offset: int = Query(0, ge=0, description="Number of results to skip"),
     current_user_id: Optional[str] = Depends(get_current_user)
@@ -712,6 +840,8 @@ async def get_results(
             "limit": limit,
             "results": results
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -761,8 +891,13 @@ async def get_results_stats(current_user_id: Optional[str] = Depends(get_current
             "status_breakdown": status_count,
             "success_rate": round(success_rate, 2),
             "completed_tasks": completed_count,
-            "active_tasks": status_count.get('pending', 0) + status_count.get('running', 0)
+            "active_tasks": sum(
+                status_count.get(status, 0)
+                for status in ['pending', 'waiting', 'running', 'pausing']
+            )
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -792,7 +927,7 @@ async def get_task_result(
         result = _booking_task_to_result(task)
         
         # Calculate next attempt time if task is active
-        if task.status.value in ['pending', 'running'] and task.last_attempt:
+        if task.status.value in ['pending', 'waiting', 'running', 'pausing'] and task.last_attempt:
             from datetime import timedelta
             next_attempt = task.last_attempt + timedelta(minutes=task.interval_minutes)
             result["next_attempt"] = next_attempt.isoformat()

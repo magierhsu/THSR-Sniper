@@ -1,6 +1,6 @@
 from __future__ import annotations
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Optional
+from typing import Iterable, List, Dict, Optional
 
 STATION_MAP = [
     "Nangang",
@@ -60,6 +60,7 @@ TIME_TABLE = [
 
 MAX_DEPARTURE_TIME_RANGE_MINUTES = 12 * 60
 DEPARTURE_TIME_RANGE_STEP_MINUTES = 30
+MAX_PREFERRED_TRAIN_NUMBERS = 20
 
 
 class TicketType:
@@ -125,26 +126,51 @@ def parse_time_string(time_str: str) -> Optional[datetime]:
     return None
 
 
-def find_earliest_train_within_range(
+def normalize_train_number(value: object) -> str:
+    """Normalize train numbers so values such as 825 and 0825 compare equally."""
+    train_number = str(value).strip()
+    if not train_number.isdigit() or not 1 <= len(train_number) <= 4:
+        raise ValueError("Train numbers must contain 1-4 digits")
+    return train_number.lstrip("0") or "0"
+
+
+def normalize_preferred_train_numbers(values: Optional[Iterable[object]]) -> List[str]:
+    """Validate, normalize and de-duplicate a preferred train list in order."""
+    if values is None:
+        return []
+
+    normalized: List[str] = []
+    seen = set()
+    for position, value in enumerate(values, start=1):
+        if position > MAX_PREFERRED_TRAIN_NUMBERS:
+            raise ValueError(
+                f"At most {MAX_PREFERRED_TRAIN_NUMBERS} preferred train numbers are allowed"
+            )
+        train_number = normalize_train_number(value)
+        if train_number not in seen:
+            seen.add(train_number)
+            normalized.append(train_number)
+
+    return normalized
+
+
+def _trains_within_range(
     trains: List[Dict[str, str]],
     target_time_idx: int,
     range_minutes: int = 30,
-) -> Optional[Dict[str, str]]:
-    """
-    Find the earliest train departing at or after the query time and within range.
-    """
+) -> List[tuple[Dict[str, str], float]]:
     if (
         not trains
         or target_time_idx < 1
         or target_time_idx > len(TIME_TABLE)
         or range_minutes < 1
     ):
-        return None
+        return []
     
     target_time_str = TIME_TABLE[target_time_idx - 1]
     target_time = _parse_time_table_to_datetime(target_time_str)
     if not target_time:
-        return None
+        return []
     
     valid_trains = []
     
@@ -162,12 +188,40 @@ def find_earliest_train_within_range(
         if 0 <= time_diff_minutes <= range_minutes:
             valid_trains.append((train, time_diff_minutes))
     
+    valid_trains.sort(key=lambda x: x[1])
+    return valid_trains
+
+
+def find_earliest_train_within_range(
+    trains: List[Dict[str, str]],
+    target_time_idx: int,
+    range_minutes: int = 30,
+) -> Optional[Dict[str, str]]:
+    """Find the earliest train departing at or after the query time and within range."""
+    valid_trains = _trains_within_range(trains, target_time_idx, range_minutes)
     if not valid_trains:
         return None
-    
-    # Return the earliest qualifying departure even if the response is unordered.
-    valid_trains.sort(key=lambda x: x[1])
     return valid_trains[0][0]
+
+
+def find_preferred_train_within_range(
+    trains: List[Dict[str, str]],
+    target_time_idx: int,
+    preferred_train_numbers: Iterable[object],
+    range_minutes: int = 30,
+) -> Optional[Dict[str, str]]:
+    """Choose the first preferred train that is inside the departure range."""
+    preferences = normalize_preferred_train_numbers(preferred_train_numbers)
+    valid_trains = _trains_within_range(trains, target_time_idx, range_minutes)
+
+    for preferred in preferences:
+        for train, _ in valid_trains:
+            try:
+                if normalize_train_number(train.get("id", "")) == preferred:
+                    return train
+            except ValueError:
+                continue
+    return None
 
 
 def _parse_time_table_to_datetime(time_str: str) -> Optional[datetime]:

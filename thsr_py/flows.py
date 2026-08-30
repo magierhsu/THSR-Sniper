@@ -10,7 +10,14 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
-from .schema import STATION_MAP, TIME_TABLE, TicketType, find_earliest_train_within_range
+from .schema import (
+    STATION_MAP,
+    TIME_TABLE,
+    TicketType,
+    find_earliest_train_within_range,
+    find_preferred_train_within_range,
+    normalize_preferred_train_numbers,
+)
 
 BASE_URL = "https://irs.thsrc.com.tw"
 BOOKING_PAGE_URL = f"{BASE_URL}/IMINT/?locale=tw"
@@ -344,6 +351,7 @@ def run(args) -> None:
     # Second page
     _print_section("Step 5: Train Selection")
     train_index = getattr(args, "train_index", None)
+    preferred_train_numbers = getattr(args, "preferred_train_numbers", [])
     target_time_idx = getattr(args, "time", None)
     time_range_minutes = getattr(args, "time_range_minutes", 30)
     soup = _confirm_train_flow(
@@ -352,6 +360,7 @@ def run(args) -> None:
         train_index,
         target_time_idx,
         time_range_minutes,
+        preferred_train_numbers,
     )
     if soup is None:
         return
@@ -583,6 +592,7 @@ def _confirm_train_flow(
     train_index: Optional[int] = None,
     target_time_idx: Optional[int] = None,
     time_range_minutes: int = 30,
+    preferred_train_numbers: Optional[List[str]] = None,
 ) -> Optional[BeautifulSoup]:
     alerts = [e.get_text(strip=True) for e in soup.select("ul.alert-body > li")]
     if alerts:
@@ -593,6 +603,11 @@ def _confirm_train_flow(
         print("✗ Error: No trains available for the selected criteria")
         return None
     
+    preferences = normalize_preferred_train_numbers(preferred_train_numbers)
+    if train_index and preferences:
+        print("✗ Error: Train index and preferred train numbers cannot be used together")
+        return None
+
     if train_index:
         # Use the specified train index
         if train_index < 1 or train_index > len(trains):
@@ -613,17 +628,21 @@ def _confirm_train_flow(
         train_id = indexed_train["id"]
         print(f"✓ Selected train {train_id} (index {train_index}) automatically")
     elif target_time_idx and target_time_idx >= 1 and target_time_idx <= len(TIME_TABLE):
-        selected = find_earliest_train_within_range(
-            trains,
-            target_time_idx,
-            range_minutes=time_range_minutes,
+        preferred_match = find_preferred_train_within_range(
+            trains, target_time_idx, preferences, range_minutes=time_range_minutes
+        )
+        selected = preferred_match or find_earliest_train_within_range(
+            trains, target_time_idx, range_minutes=time_range_minutes
         )
         if selected:
             selected_train = selected["form_value"]
             train_id = selected["id"]
             depart_time = selected["depart"]
+            selection_reason = (
+                "preferred train" if preferred_match else "earliest train"
+            )
             print(
-                f"✓ Auto-selected earliest train {train_id} at {depart_time} "
+                f"✓ Auto-selected {selection_reason} {train_id} at {depart_time} "
                 f"(within {time_range_minutes} minutes after the query time)"
             )
         else:

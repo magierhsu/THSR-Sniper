@@ -20,11 +20,13 @@ import os
 from .flows import run as run_booking_flow
 from .schema import (
     MAX_DEPARTURE_TIME_RANGE_MINUTES,
+    MAX_PREFERRED_TRAIN_NUMBERS,
     STATION_MAP,
     TIME_TABLE,
     TicketType,
     get_taiwan_now,
     is_ticket_sales_open,
+    normalize_preferred_train_numbers,
 )
 
 
@@ -72,6 +74,20 @@ class BookingStatus(Enum):
     CANCELLED = "cancelled"
     DELETED = "deleted"
     WAITING = "waiting"
+    PAUSING = "pausing"
+    PAUSED = "paused"
+
+
+class TaskNotFoundError(LookupError):
+    pass
+
+
+class TaskOwnershipError(PermissionError):
+    pass
+
+
+class TaskStateError(ValueError):
+    pass
 
 
 @dataclass
@@ -89,6 +105,7 @@ class BookingTask:
     time: Optional[int] = None
     time_range_minutes: int = 30
     train_index: Optional[int] = None
+    preferred_train_numbers: List[str] = field(default_factory=list)
     seat_prefer: Optional[int] = None
     class_type: Optional[int] = None
     personal_id: Optional[str] = None
@@ -138,6 +155,7 @@ class BookingTask:
             time=self.time,
             time_range_minutes=self.time_range_minutes,
             train_index=self.train_index,
+            preferred_train_numbers=list(self.preferred_train_numbers),
             seat_prefer=self.seat_prefer,
             class_type=self.class_type,
             personal_id=self.personal_id,
@@ -163,6 +181,7 @@ class BookingTask:
             "time": self.time,
             "time_range_minutes": self.time_range_minutes,
             "train_index": self.train_index,
+            "preferred_train_numbers": list(self.preferred_train_numbers),
             "seat_prefer": self.seat_prefer,
             "class_type": self.class_type,
             "personal_id": self.personal_id,
@@ -195,6 +214,9 @@ class BookingTask:
             time=data.get("time"),
             time_range_minutes=data.get("time_range_minutes", 30),
             train_index=data.get("train_index"),
+            preferred_train_numbers=normalize_preferred_train_numbers(
+                data.get("preferred_train_numbers", [])
+            ),
             seat_prefer=data.get("seat_prefer"),
             class_type=data.get("class_type"),
             personal_id=data.get("personal_id"),
@@ -270,6 +292,21 @@ class BookingScheduler:
         # Load existing tasks if persistence is enabled
         if self.enable_persistence:
             self._load_tasks()
+            self._recover_interrupted_tasks()
+
+    def _recover_interrupted_tasks(self) -> None:
+        """Recover states left behind when the service stopped mid-attempt."""
+        changed = False
+        with self._state_lock:
+            for task in self.tasks.values():
+                if task.status == BookingStatus.RUNNING:
+                    task.status = BookingStatus.PENDING
+                    changed = True
+                elif task.status == BookingStatus.PAUSING:
+                    task.status = BookingStatus.PAUSED
+                    changed = True
+            if changed:
+                self._save_tasks_locked()
     
     def _setup_logger(self) -> logging.Logger:
         """Setup logging for the scheduler."""
@@ -472,11 +509,11 @@ class BookingScheduler:
     
     def add_task(self, task: BookingTask) -> str:
         """Add a new booking task."""
-        if not task.id:
-            task.id = str(uuid.uuid4())
-        
-        self.tasks[task.id] = task
-        self._save_tasks()
+        with self._state_lock:
+            if not task.id:
+                task.id = str(uuid.uuid4())
+            self.tasks[task.id] = task
+            self._save_tasks_locked()
         self.logger.info(f"Added new booking task: {task.id}")
         return task.id
     
@@ -503,40 +540,136 @@ class BookingScheduler:
     
     def cancel_task(self, task_id: str, user_id: Optional[str] = None) -> bool:
         """Cancel a specific task."""
-        # Reload to get latest state
-        self._load_tasks()
-        if task_id in self.tasks:
-            task = self.tasks[task_id]
-            
-            # Check user ownership if user_id is provided
+        with self._state_lock:
+            self._load_tasks()
+            if task_id in self.tasks:
+                task = self.tasks[task_id]
+                if user_id is not None and task.user_id != user_id:
+                    self.logger.warning(f"User {user_id} attempted to cancel task {task_id} owned by {task.user_id}")
+                    return False
+                task.status = BookingStatus.CANCELLED
+                self._save_tasks_locked()
+                self.logger.info(f"Cancelled task: {task_id}")
+                return True
+            return False
+
+    def pause_task(self, task_id: str, user_id: Optional[str] = None) -> BookingTask:
+        """Pause immediately when idle, or request a pause after a running attempt."""
+        with self._state_lock:
+            task = self.tasks.get(task_id)
+            if task is None:
+                raise TaskNotFoundError(task_id)
             if user_id is not None and task.user_id != user_id:
-                self.logger.warning(f"User {user_id} attempted to cancel task {task_id} owned by {task.user_id}")
-                return False
-            
-            task.status = BookingStatus.CANCELLED
-            self._save_tasks()
-            self.logger.info(f"Cancelled task: {task_id}")
-            return True
-        return False
+                raise TaskOwnershipError(task_id)
+
+            if task.status in [BookingStatus.PENDING, BookingStatus.WAITING]:
+                task.status = BookingStatus.PAUSED
+            elif task.status == BookingStatus.RUNNING:
+                task.status = BookingStatus.PAUSING
+            elif task.status not in [BookingStatus.PAUSING, BookingStatus.PAUSED]:
+                raise TaskStateError(
+                    f"Task cannot be paused from {task.status.value} status"
+                )
+
+            self._save_tasks_locked()
+            return task
+
+    def resume_task(self, task_id: str, user_id: Optional[str] = None) -> BookingTask:
+        """Resume a paused task and make it immediately eligible to run."""
+        with self._state_lock:
+            task = self.tasks.get(task_id)
+            if task is None:
+                raise TaskNotFoundError(task_id)
+            if user_id is not None and task.user_id != user_id:
+                raise TaskOwnershipError(task_id)
+            if task.status != BookingStatus.PAUSED:
+                raise TaskStateError("Only paused tasks can be resumed")
+            if task.max_attempts and task.attempts >= task.max_attempts:
+                raise TaskStateError(
+                    "Maximum attempts reached; edit the task before resuming"
+                )
+
+            task.status = (
+                BookingStatus.PENDING
+                if is_ticket_sales_open(task.date)
+                else BookingStatus.WAITING
+            )
+            task.last_attempt = None
+            self._save_tasks_locked()
+            return task
+
+    def update_task(
+        self,
+        task_id: str,
+        replacement: BookingTask,
+        user_id: Optional[str] = None,
+    ) -> BookingTask:
+        """Replace editable booking settings while retaining task identity."""
+        editable_fields = (
+            "from_station",
+            "to_station",
+            "date",
+            "adult_cnt",
+            "student_cnt",
+            "child_cnt",
+            "senior_cnt",
+            "disabled_cnt",
+            "time",
+            "time_range_minutes",
+            "train_index",
+            "preferred_train_numbers",
+            "seat_prefer",
+            "class_type",
+            "personal_id",
+            "use_membership",
+            "no_ocr",
+            "interval_minutes",
+            "max_attempts",
+        )
+
+        with self._state_lock:
+            task = self.tasks.get(task_id)
+            if task is None:
+                raise TaskNotFoundError(task_id)
+            if user_id is not None and task.user_id != user_id:
+                raise TaskOwnershipError(task_id)
+            if task.status != BookingStatus.PAUSED:
+                raise TaskStateError("Only paused tasks can be edited")
+
+            for field_name in editable_fields:
+                value = getattr(replacement, field_name)
+                if field_name == "preferred_train_numbers":
+                    value = list(value)
+                setattr(task, field_name, value)
+
+            task.attempts = 0
+            task.last_attempt = None
+            task.success_pnr = None
+            task.error_message = None
+            if hasattr(task, "result"):
+                task.result = None
+            self._save_tasks_locked()
+            return task
     
     def remove_task(self, task_id: str, user_id: Optional[str] = None) -> bool:
         """Mark a task as deleted instead of removing it completely."""
         # Reload to get latest state
-        self._load_tasks()
-        if task_id in self.tasks:
-            task = self.tasks[task_id]
+        with self._state_lock:
+            self._load_tasks()
+            if task_id in self.tasks:
+                task = self.tasks[task_id]
             
             # Check user ownership if user_id is provided
-            if user_id is not None and task.user_id != user_id:
-                self.logger.warning(f"User {user_id} attempted to remove task {task_id} owned by {task.user_id}")
-                return False
+                if user_id is not None and task.user_id != user_id:
+                    self.logger.warning(f"User {user_id} attempted to remove task {task_id} owned by {task.user_id}")
+                    return False
             
             # Mark as deleted instead of removing
-            task.status = BookingStatus.DELETED
-            self._save_tasks()
-            self.logger.info(f"Marked task as deleted: {task_id}")
-            return True
-        return False
+                task.status = BookingStatus.DELETED
+                self._save_tasks_locked()
+                self.logger.info(f"Marked task as deleted: {task_id}")
+                return True
+            return False
     
     def start_scheduler(self) -> bool:
         """Start the scheduler in a background thread."""
@@ -621,59 +754,61 @@ class BookingScheduler:
         current_time = datetime.now(timezone.utc)
         due_tasks = []
         state_changed = False
-        
-        for task in list(self.tasks.values()):
-            if task.status in [BookingStatus.SUCCESS, BookingStatus.CANCELLED, BookingStatus.DELETED]:
-                continue
-            
-            # Check if task is expired
-            if task.is_expired():
-                task.status = BookingStatus.EXPIRED
-                state_changed = True
-                self.logger.info(f"Task {task.id} expired")
-                continue
-            
-            # Check if task should stop
-            if task.should_stop():
-                task.status = BookingStatus.FAILED
-                task.error_message = "Maximum attempts reached"
-                state_changed = True
-                self.logger.info(f"Task {task.id} stopped after {task.attempts} attempts")
-                continue
-            
-            # Check if ticket sales are open for future booking dates
-            if not is_ticket_sales_open(task.date):
-                if task.status != BookingStatus.WAITING:
-                    task.status = BookingStatus.WAITING
+
+        with self._state_lock:
+            for task in list(self.tasks.values()):
+                if task.status in [
+                    BookingStatus.SUCCESS,
+                    BookingStatus.CANCELLED,
+                    BookingStatus.DELETED,
+                    BookingStatus.PAUSED,
+                    BookingStatus.PAUSING,
+                    BookingStatus.RUNNING,
+                ]:
+                    continue
+
+                if task.is_expired():
+                    task.status = BookingStatus.EXPIRED
                     state_changed = True
-                    self.logger.info(f"Task {task.id} waiting for ticket sales to open at 00:00 Taiwan time")
-                continue
-            
-            # If task was waiting and ticket sales are now open, change to pending
-            if task.status == BookingStatus.WAITING:
-                task.status = BookingStatus.PENDING
-                state_changed = True
-                self.logger.info(f"Task {task.id} ticket sales now open, resuming booking attempts")
-            
-            # Check if it's time to run this task
-            if task.last_attempt is None:
-                should_run = True
-            else:
-                # Ensure both datetimes are timezone-aware for comparison
-                task_last_attempt = task.last_attempt
-                if task_last_attempt.tzinfo is None:
-                    task_last_attempt = task_last_attempt.replace(tzinfo=timezone.utc)
-                
-                time_since_last = current_time - task_last_attempt
-                should_run = time_since_last >= timedelta(minutes=task.interval_minutes)
-            
-            if should_run:
-                due_tasks.append(task)
+                    self.logger.info(f"Task {task.id} expired")
+                    continue
+
+                if task.should_stop():
+                    task.status = BookingStatus.FAILED
+                    task.error_message = "Maximum attempts reached"
+                    state_changed = True
+                    self.logger.info(f"Task {task.id} stopped after {task.attempts} attempts")
+                    continue
+
+                if not is_ticket_sales_open(task.date):
+                    if task.status != BookingStatus.WAITING:
+                        task.status = BookingStatus.WAITING
+                        state_changed = True
+                        self.logger.info(f"Task {task.id} waiting for ticket sales to open at 00:00 Taiwan time")
+                    continue
+
+                if task.status == BookingStatus.WAITING:
+                    task.status = BookingStatus.PENDING
+                    state_changed = True
+                    self.logger.info(f"Task {task.id} ticket sales now open, resuming booking attempts")
+
+                if task.last_attempt is None:
+                    should_run = True
+                else:
+                    task_last_attempt = task.last_attempt
+                    if task_last_attempt.tzinfo is None:
+                        task_last_attempt = task_last_attempt.replace(tzinfo=timezone.utc)
+                    time_since_last = current_time - task_last_attempt
+                    should_run = time_since_last >= timedelta(minutes=task.interval_minutes)
+
+                if should_run:
+                    due_tasks.append(task)
+
+            if state_changed and not due_tasks:
+                self._save_tasks_locked()
 
         if due_tasks:
             self._execute_booking_tasks(due_tasks, current_time)
-        elif state_changed:
-            self._save_tasks()
         
         # Periodically clean up old deleted tasks (every hour)
         self._cleanup_deleted_tasks(current_time)
@@ -749,32 +884,29 @@ class BookingScheduler:
             return
 
         future_to_task = {}
-        for task in tasks:
-            if task.status in [
-                BookingStatus.SUCCESS,
-                BookingStatus.CANCELLED,
-                BookingStatus.DELETED,
-            ]:
-                continue
+        with self._state_lock:
+            for task in tasks:
+                if task.status != BookingStatus.PENDING:
+                    continue
 
-            task.status = BookingStatus.RUNNING
-            task.last_attempt = attempt_time
-            task.attempts += 1
-            self.logger.info(f"Executing task {task.id} (attempt {task.attempts})")
+                task.status = BookingStatus.RUNNING
+                task.last_attempt = attempt_time
+                task.attempts += 1
+                self.logger.info(f"Executing task {task.id} (attempt {task.attempts})")
 
-            try:
-                future = self._booking_executor.submit(
-                    _run_booking_flow_worker, task.to_args_namespace()
-                )
-                future_to_task[future] = task
-            except Exception as exc:
-                task.status = BookingStatus.PENDING
-                task.error_message = f"Booking worker submission error: {exc}"[:500]
-                self.logger.error(
-                    f"Task {task.id} could not be submitted to a worker: {exc}"
-                )
+                try:
+                    future = self._booking_executor.submit(
+                        _run_booking_flow_worker, task.to_args_namespace()
+                    )
+                    future_to_task[future] = task
+                except Exception as exc:
+                    task.status = BookingStatus.PENDING
+                    task.error_message = f"Booking worker submission error: {exc}"[:500]
+                    self.logger.error(
+                        f"Task {task.id} could not be submitted to a worker: {exc}"
+                    )
 
-        self._save_tasks()
+            self._save_tasks_locked()
 
         for future in as_completed(future_to_task):
             task = future_to_task[future]
@@ -785,14 +917,15 @@ class BookingScheduler:
                 stderr_output = ""
                 worker_error = f"{type(exc).__name__}: {exc}"
 
-            self._apply_booking_result(
-                task, output, stderr_output, worker_error
-            )
-            self.logger.info(
-                f"Task {task.id} FINAL SAVE - status={task.status.value}, "
-                f"pnr={task.success_pnr}"
-            )
-            self._save_tasks()
+            with self._state_lock:
+                self._apply_booking_result(
+                    task, output, stderr_output, worker_error
+                )
+                self.logger.info(
+                    f"Task {task.id} FINAL SAVE - status={task.status.value}, "
+                    f"pnr={task.success_pnr}"
+                )
+                self._save_tasks_locked()
             self.logger.info(
                 f"Task {task.id} SAVE COMPLETED - status={task.status.value}, "
                 f"attempts={task.attempts}"
@@ -850,7 +983,11 @@ class BookingScheduler:
         else:
             task.error_message = "Booking failed - no PNR code found"
 
-        task.status = BookingStatus.PENDING
+        task.status = (
+            BookingStatus.PAUSED
+            if task.status == BookingStatus.PAUSING
+            else BookingStatus.PENDING
+        )
         self.logger.warning(
             f"Task {task.id} attempt {task.attempts} failed: {task.error_message}"
         )
@@ -898,6 +1035,7 @@ def create_booking_task(
     time: Optional[int] = None,
     time_range_minutes: int = 30,
     train_index: Optional[int] = None,
+    preferred_train_numbers: Optional[List[str]] = None,
     seat_prefer: Optional[int] = None,
     class_type: Optional[int] = None,
     interval_minutes: int = 5,
@@ -965,6 +1103,18 @@ def create_booking_task(
     
     if train_index is not None and train_index < 1:
         raise ValueError(f"Invalid train index: {train_index} (must be >= 1)")
+
+    normalized_preferred_trains = normalize_preferred_train_numbers(
+        preferred_train_numbers
+    )
+    if train_index is not None and normalized_preferred_trains:
+        raise ValueError(
+            "train_index and preferred_train_numbers cannot be used together"
+        )
+    if len(normalized_preferred_trains) > MAX_PREFERRED_TRAIN_NUMBERS:
+        raise ValueError(
+            f"At most {MAX_PREFERRED_TRAIN_NUMBERS} preferred trains are allowed"
+        )
     
     if seat_prefer is not None and seat_prefer not in [0, 1, 2]:
         raise ValueError(f"Invalid seat preference: {seat_prefer} (must be 0, 1, or 2)")
@@ -977,6 +1127,8 @@ def create_booking_task(
         raise ValueError(f"Interval must be at least 1 minute: {interval_minutes}")
     if interval_minutes > 60:
         raise ValueError(f"Interval should not exceed 60 minutes: {interval_minutes}")
+    if max_attempts is not None and max_attempts < 1:
+        raise ValueError(f"Maximum attempts must be at least 1: {max_attempts}")
     
     # Validate personal ID format (basic check)
     personal_id = personal_id.strip().upper()
@@ -999,6 +1151,7 @@ def create_booking_task(
         time=time,
         time_range_minutes=time_range_minutes,
         train_index=train_index,
+        preferred_train_numbers=normalized_preferred_trains,
         seat_prefer=seat_prefer,
         class_type=class_type,
         interval_minutes=interval_minutes,

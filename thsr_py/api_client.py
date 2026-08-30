@@ -6,7 +6,7 @@ Provides CLI interface that calls the API backend.
 
 import json
 import sys
-from typing import Optional, Dict, Any
+from typing import Any, Dict, List, Optional
 import requests
 from datetime import datetime
 
@@ -79,6 +79,7 @@ class THSRApiClient:
         time: Optional[int] = None,
         time_range_minutes: int = 30,
         train_index: Optional[int] = None,
+        preferred_train_numbers: Optional[List[str]] = None,
         seat_prefer: Optional[int] = None,
         class_type: Optional[int] = None,
         interval_minutes: int = 5,
@@ -105,6 +106,8 @@ class THSRApiClient:
         payload["time_range_minutes"] = time_range_minutes
         if train_index is not None:
             payload["train_index"] = train_index
+        if preferred_train_numbers:
+            payload["preferred_train_numbers"] = preferred_train_numbers
         if seat_prefer is not None:
             payload["seat_prefer"] = seat_prefer
         if class_type is not None:
