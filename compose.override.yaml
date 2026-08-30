@@ -1,0 +1,21 @@
+services:
+  thsr-sniper-api:
+    ports: !override
+      - "127.0.0.1:8000:8000"
+
+  mysql:
+    ports: !override
+      - "127.0.0.1:3306:3306"
+
+  phpmyadmin:
+    profiles: ["admin"]
+    ports: !override
+      - "127.0.0.1:8080:80"
+
+  thsr-sniper-auth:
+    ports: !override
+      - "127.0.0.1:8001:8001"
+
+  thsr-sniper-frontend:
+    ports: !override
+      - "3000:80"
