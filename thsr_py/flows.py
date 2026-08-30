@@ -10,7 +10,7 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
-from .schema import STATION_MAP, TIME_TABLE, TicketType, find_closest_train_within_range
+from .schema import STATION_MAP, TIME_TABLE, TicketType, find_earliest_train_within_range
 
 BASE_URL = "https://irs.thsrc.com.tw"
 BOOKING_PAGE_URL = f"{BASE_URL}/IMINT/?locale=tw"
@@ -345,7 +345,14 @@ def run(args) -> None:
     _print_section("Step 5: Train Selection")
     train_index = getattr(args, "train_index", None)
     target_time_idx = getattr(args, "time", None)
-    soup = _confirm_train_flow(session, soup, train_index, target_time_idx)
+    time_range_minutes = getattr(args, "time_range_minutes", 30)
+    soup = _confirm_train_flow(
+        session,
+        soup,
+        train_index,
+        target_time_idx,
+        time_range_minutes,
+    )
     if soup is None:
         return
 
@@ -570,7 +577,13 @@ class _BookingPayload:
                 self.security_code = ""
 
 
-def _confirm_train_flow(session: requests.Session, soup: BeautifulSoup, train_index: Optional[int] = None, target_time_idx: Optional[int] = None) -> Optional[BeautifulSoup]:
+def _confirm_train_flow(
+    session: requests.Session,
+    soup: BeautifulSoup,
+    train_index: Optional[int] = None,
+    target_time_idx: Optional[int] = None,
+    time_range_minutes: int = 30,
+) -> Optional[BeautifulSoup]:
     alerts = [e.get_text(strip=True) for e in soup.select("ul.alert-body > li")]
     if alerts:
         print("\n".join(alerts))
@@ -585,19 +598,39 @@ def _confirm_train_flow(session: requests.Session, soup: BeautifulSoup, train_in
         if train_index < 1 or train_index > len(trains):
             print(f"✗ Error: Train index {train_index} is out of range (1-{len(trains)})")
             return None
-        selected_train = trains[train_index - 1]["form_value"]
-        train_id = trains[train_index - 1]["id"]
+        indexed_train = trains[train_index - 1]
+        if target_time_idx and not find_earliest_train_within_range(
+            [indexed_train],
+            target_time_idx,
+            range_minutes=time_range_minutes,
+        ):
+            print(
+                f"✗ Error: Train {indexed_train['id']} at {indexed_train['depart']} "
+                f"is outside the accepted departure range"
+            )
+            return None
+        selected_train = indexed_train["form_value"]
+        train_id = indexed_train["id"]
         print(f"✓ Selected train {train_id} (index {train_index}) automatically")
     elif target_time_idx and target_time_idx >= 1 and target_time_idx <= len(TIME_TABLE):
-        # Auto-booking mode: find closest train within ±30 minutes of target time
-        closest_train = find_closest_train_within_range(trains, target_time_idx, tolerance_hours=0.5)
-        if closest_train:
-            selected_train = closest_train["form_value"]
-            train_id = closest_train["id"]
-            depart_time = closest_train["depart"]
-            print(f"✓ Auto-selected closest train {train_id} at {depart_time} (within ±30 minutes of target time)")
+        selected = find_earliest_train_within_range(
+            trains,
+            target_time_idx,
+            range_minutes=time_range_minutes,
+        )
+        if selected:
+            selected_train = selected["form_value"]
+            train_id = selected["id"]
+            depart_time = selected["depart"]
+            print(
+                f"✓ Auto-selected earliest train {train_id} at {depart_time} "
+                f"(within {time_range_minutes} minutes after the query time)"
+            )
         else:
-            print("✗ Error: No trains available within ±30 minutes of the target time")
+            print(
+                f"✗ Error: No trains depart between the query time and "
+                f"{time_range_minutes} minutes after it"
+            )
             return None
     else:
         # Manual selection

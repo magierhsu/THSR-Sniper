@@ -13,7 +13,7 @@ from .scheduler import (
     BookingTask, BookingStatus, 
     get_scheduler, create_booking_task
 )
-from .schema import STATION_MAP, TIME_TABLE
+from .schema import MAX_DEPARTURE_TIME_RANGE_MINUTES, STATION_MAP, TIME_TABLE
 from .flows import run as run_booking_flow
 
 # Utility function to clean ANSI color codes
@@ -68,7 +68,13 @@ class BookingRequest(BaseModel):
     child_cnt: Optional[int] = Field(None, ge=0, le=10, description="Number of child tickets (0-10)")
     senior_cnt: Optional[int] = Field(None, ge=0, le=10, description="Number of senior tickets (0-10)")
     disabled_cnt: Optional[int] = Field(None, ge=0, le=10, description="Number of disabled tickets (0-10)")
-    time: Optional[int] = Field(None, ge=1, le=38, description="Departure time ID (1-38)")
+    time: int = Field(..., ge=1, le=38, description="Required departure query time ID (1-38)")
+    time_range_minutes: int = Field(
+        30,
+        ge=1,
+        le=MAX_DEPARTURE_TIME_RANGE_MINUTES,
+        description="Accepted departure range after query time, in minutes",
+    )
     train_index: Optional[int] = Field(None, ge=1, description="Train selection index")
     seat_prefer: Optional[int] = Field(None, ge=0, le=2, description="Seat preference: 0=any, 1=window, 2=aisle")
     class_type: Optional[int] = Field(None, ge=0, le=1, description="Class type: 0=standard, 1=business")
@@ -137,6 +143,7 @@ class TaskStatusResponse(BaseModel):
     senior_cnt: Optional[int] = None
     disabled_cnt: Optional[int] = None
     time: Optional[int] = None
+    time_range_minutes: int = 30
     train_index: Optional[int] = None
     interval_minutes: int
     attempts: int
@@ -248,6 +255,7 @@ async def immediate_booking(request: BookingRequest):
             senior_cnt=request.senior_cnt if request.senior_cnt is not None else 0,
             disabled_cnt=request.disabled_cnt if request.disabled_cnt is not None else 0,
             time=request.time,
+            time_range_minutes=request.time_range_minutes,
             train_index=request.train_index,
             seat_prefer=request.seat_prefer,
             class_type=request.class_type,
@@ -341,6 +349,7 @@ async def schedule_booking(
             interval_minutes=request.interval_minutes,
             max_attempts=request.max_attempts,
             time=request.time,
+            time_range_minutes=request.time_range_minutes,
             train_index=request.train_index,
             seat_prefer=request.seat_prefer,
             class_type=request.class_type,
@@ -388,6 +397,7 @@ async def list_tasks(current_user_id: Optional[str] = Depends(get_current_user))
             senior_cnt=task.senior_cnt,
             disabled_cnt=task.disabled_cnt,
             time=task.time,
+            time_range_minutes=task.time_range_minutes,
             train_index=task.train_index,
             interval_minutes=task.interval_minutes,
             attempts=task.attempts,
@@ -432,6 +442,7 @@ async def get_task_status(
         senior_cnt=task.senior_cnt,
         disabled_cnt=task.disabled_cnt,
         time=task.time,
+        time_range_minutes=task.time_range_minutes,
         train_index=task.train_index,
         interval_minutes=task.interval_minutes,
         attempts=task.attempts,
@@ -535,6 +546,36 @@ _thsr_connectivity_cache = {
     "last_checked": 0,
     "cache_duration": 60  # Cache for 60 seconds
 }
+
+
+def _booking_task_to_result(task: BookingTask) -> Dict[str, object]:
+    return {
+        "id": task.id,
+        "status": task.status.value,
+        "from_station": task.from_station,
+        "to_station": task.to_station,
+        "date": task.date,
+        "adult_cnt": task.adult_cnt,
+        "student_cnt": task.student_cnt,
+        "child_cnt": task.child_cnt,
+        "senior_cnt": task.senior_cnt,
+        "disabled_cnt": task.disabled_cnt,
+        "personal_id": task.personal_id,
+        "use_membership": task.use_membership,
+        "interval_minutes": task.interval_minutes,
+        "max_attempts": task.max_attempts,
+        "attempts": task.attempts,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "last_attempt": task.last_attempt.isoformat() if task.last_attempt else None,
+        "time": task.time,
+        "time_range_minutes": task.time_range_minutes,
+        "seat_prefer": task.seat_prefer,
+        "class_type": task.class_type,
+        "no_ocr": task.no_ocr,
+        "result": getattr(task, "result", None),
+        "success_pnr": getattr(task, "success_pnr", None),
+        "error": getattr(task, "error", None),
+    }
 
 @app.get("/health/thsr")
 async def test_thsr_connectivity():
@@ -662,35 +703,7 @@ async def get_results(
         tasks = tasks[offset:offset + limit]
         
         # Convert to response format
-        results = []
-        for task in tasks:
-            result = {
-                "id": task.id,
-                "status": task.status.value,
-                "from_station": task.from_station,
-                "to_station": task.to_station,
-                "date": task.date,
-                "adult_cnt": task.adult_cnt,
-                "student_cnt": task.student_cnt,
-                "child_cnt": task.child_cnt,
-                "senior_cnt": task.senior_cnt,
-                "disabled_cnt": task.disabled_cnt,
-                "personal_id": task.personal_id,
-                "use_membership": task.use_membership,
-                "interval_minutes": task.interval_minutes,
-                "max_attempts": task.max_attempts,
-                "attempts": task.attempts,
-                "created_at": task.created_at.isoformat() if task.created_at else None,
-                "last_attempt": task.last_attempt.isoformat() if task.last_attempt else None,
-                "time": task.time,
-                "seat_prefer": task.seat_prefer,
-                "class_type": task.class_type,
-                "no_ocr": task.no_ocr,
-                "result": getattr(task, 'result', None),
-                "success_pnr": getattr(task, 'success_pnr', None),
-                "error": getattr(task, 'error', None)
-            }
-            results.append(result)
+        results = [_booking_task_to_result(task) for task in tasks]
         
         return {
             "success": True,
@@ -776,32 +789,7 @@ async def get_task_result(
             raise HTTPException(status_code=403, detail="Access denied: You can only view your own tasks")
         
         # Detailed task information
-        result = {
-            "id": task.id,
-            "status": task.status.value,
-            "from_station": task.from_station,
-            "to_station": task.to_station,
-            "date": task.date,
-            "adult_cnt": task.adult_cnt,
-            "student_cnt": task.student_cnt,
-            "child_cnt": task.child_cnt,
-            "senior_cnt": task.senior_cnt,
-            "disabled_cnt": task.disabled_cnt,
-            "personal_id": task.personal_id,
-            "use_membership": task.use_membership,
-            "interval_minutes": task.interval_minutes,
-            "max_attempts": task.max_attempts,
-            "attempts": task.attempts,
-            "created_at": task.created_at.isoformat() if task.created_at else None,
-            "last_attempt": task.last_attempt.isoformat() if task.last_attempt else None,
-            "time": task.time,
-            "seat_prefer": task.seat_prefer,
-            "class_type": task.class_type,
-            "no_ocr": task.no_ocr,
-            "result": getattr(task, 'result', None),
-            "success_pnr": getattr(task, 'success_pnr', None),
-            "error": getattr(task, 'error', None)
-        }
+        result = _booking_task_to_result(task)
         
         # Calculate next attempt time if task is active
         if task.status.value in ['pending', 'running'] and task.last_attempt:

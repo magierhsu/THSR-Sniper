@@ -14,7 +14,7 @@ import fcntl
 import os
 
 from .flows import run as run_booking_flow
-from .schema import STATION_MAP, TIME_TABLE, TicketType, is_ticket_sales_open, get_taiwan_now
+from .schema import MAX_DEPARTURE_TIME_RANGE_MINUTES, STATION_MAP, TIME_TABLE, TicketType, is_ticket_sales_open, get_taiwan_now
 
 
 class BookingStatus(Enum):
@@ -41,6 +41,7 @@ class BookingTask:
     senior_cnt: Optional[int] = None
     disabled_cnt: Optional[int] = None
     time: Optional[int] = None
+    time_range_minutes: int = 30
     train_index: Optional[int] = None
     seat_prefer: Optional[int] = None
     class_type: Optional[int] = None
@@ -85,7 +86,11 @@ class BookingTask:
             date=self.date,
             adult_cnt=self.adult_cnt,
             student_cnt=self.student_cnt,
+            child_cnt=self.child_cnt,
+            senior_cnt=self.senior_cnt,
+            disabled_cnt=self.disabled_cnt,
             time=self.time,
+            time_range_minutes=self.time_range_minutes,
             train_index=self.train_index,
             seat_prefer=self.seat_prefer,
             class_type=self.class_type,
@@ -110,6 +115,7 @@ class BookingTask:
             "senior_cnt": self.senior_cnt,
             "disabled_cnt": self.disabled_cnt,
             "time": self.time,
+            "time_range_minutes": self.time_range_minutes,
             "train_index": self.train_index,
             "seat_prefer": self.seat_prefer,
             "class_type": self.class_type,
@@ -141,6 +147,7 @@ class BookingTask:
             senior_cnt=data.get("senior_cnt"),
             disabled_cnt=data.get("disabled_cnt"),
             time=data.get("time"),
+            time_range_minutes=data.get("time_range_minutes", 30),
             train_index=data.get("train_index"),
             seat_prefer=data.get("seat_prefer"),
             class_type=data.get("class_type"),
@@ -730,6 +737,7 @@ def create_booking_task(
     senior_cnt: Optional[int] = None,
     disabled_cnt: Optional[int] = None,
     time: Optional[int] = None,
+    time_range_minutes: int = 30,
     train_index: Optional[int] = None,
     seat_prefer: Optional[int] = None,
     class_type: Optional[int] = None,
@@ -785,8 +793,16 @@ def create_booking_task(
         raise ValueError(f"Disabled ticket count must be 0-10: {disabled_cnt}")
     
     # Validate optional parameters
-    if time is not None and not 1 <= time <= len(TIME_TABLE):
+    if time is None:
+        raise ValueError("Departure time is required")
+    if not 1 <= time <= len(TIME_TABLE):
         raise ValueError(f"Invalid time slot: {time} (must be 1-{len(TIME_TABLE)})")
+
+    if not 1 <= time_range_minutes <= MAX_DEPARTURE_TIME_RANGE_MINUTES:
+        raise ValueError(
+            f"Departure time range must be 1-{MAX_DEPARTURE_TIME_RANGE_MINUTES} "
+            f"minutes: {time_range_minutes}"
+        )
     
     if train_index is not None and train_index < 1:
         raise ValueError(f"Invalid train index: {train_index} (must be >= 1)")
@@ -822,6 +838,7 @@ def create_booking_task(
         senior_cnt=senior_cnt,
         disabled_cnt=disabled_cnt,
         time=time,
+        time_range_minutes=time_range_minutes,
         train_index=train_index,
         seat_prefer=seat_prefer,
         class_type=class_type,

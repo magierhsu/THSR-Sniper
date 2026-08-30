@@ -74,7 +74,8 @@ export interface BookingRequest {
   child_cnt?: number;
   senior_cnt?: number;
   disabled_cnt?: number;
-  time?: number;
+  time: number;
+  time_range_minutes: number;
   train_index?: number;
   seat_prefer?: number;
   class_type?: number;
@@ -107,6 +108,7 @@ export interface TaskStatusResponse {
   error_message?: string;
   created_at: string;
   time?: number;
+  time_range_minutes: number;
   train_index?: number;
   adult_cnt?: number;
   student_cnt?: number;
@@ -135,6 +137,7 @@ export interface BookingTask {
   created_at: string;
   last_attempt?: string;
   time?: number;
+  time_range_minutes?: number;
   seat_prefer?: number;
   class_type?: number;
   no_ocr?: boolean;
@@ -180,7 +183,8 @@ export interface BookingFormData {
   childCount: number;
   seniorCount: number;
   disabledCount: number;
-  departureTime?: number;
+  departureTime: number;
+  departureTimeRangeMinutes: number;
   trainIndex?: number;
   seatPreference: number;
   classType: number;

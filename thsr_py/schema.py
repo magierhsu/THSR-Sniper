@@ -58,6 +58,10 @@ TIME_TABLE = [
     "1130P",
 ]
 
+MAX_DEPARTURE_TIME_RANGE_MINUTES = 12 * 60
+DEPARTURE_TIME_RANGE_STEP_MINUTES = 30
+
+
 class TicketType:
     Adult = "F"
     Child = "H"
@@ -121,12 +125,20 @@ def parse_time_string(time_str: str) -> Optional[datetime]:
     return None
 
 
-def find_closest_train_within_range(trains: List[Dict[str, str]], target_time_idx: int, tolerance_hours: float = 0.5) -> Optional[Dict[str, str]]:
+def find_earliest_train_within_range(
+    trains: List[Dict[str, str]],
+    target_time_idx: int,
+    range_minutes: int = 30,
+) -> Optional[Dict[str, str]]:
     """
-    Find the closest train within ±tolerance_hours of the target time.
-    Returns the train closest to the target time, or None if no trains are within range.
+    Find the earliest train departing at or after the query time and within range.
     """
-    if not trains or target_time_idx < 1 or target_time_idx > len(TIME_TABLE):
+    if (
+        not trains
+        or target_time_idx < 1
+        or target_time_idx > len(TIME_TABLE)
+        or range_minutes < 1
+    ):
         return None
     
     target_time_str = TIME_TABLE[target_time_idx - 1]
@@ -145,16 +157,15 @@ def find_closest_train_within_range(trains: List[Dict[str, str]], target_time_id
         if not train_time:
             continue
         
-        # Calculate time difference in hours
-        time_diff = abs((train_time - target_time).total_seconds()) / 3600
+        time_diff_minutes = (train_time - target_time).total_seconds() / 60
         
-        if time_diff <= tolerance_hours:
-            valid_trains.append((train, time_diff))
+        if 0 <= time_diff_minutes <= range_minutes:
+            valid_trains.append((train, time_diff_minutes))
     
     if not valid_trains:
         return None
     
-    # Return the train with the smallest time difference
+    # Return the earliest qualifying departure even if the response is unordered.
     valid_trains.sort(key=lambda x: x[1])
     return valid_trains[0][0]
 

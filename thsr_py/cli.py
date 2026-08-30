@@ -4,6 +4,11 @@ import argparse
 import os
 from datetime import datetime, timedelta
 
+from .schema import (
+    DEPARTURE_TIME_RANGE_STEP_MINUTES,
+    MAX_DEPARTURE_TIME_RANGE_MINUTES,
+)
+
 
 def _get_colored_banner() -> str:
     """Get colored ASCII art banner for the CLI."""
@@ -116,6 +121,18 @@ Examples:
         dest="time", 
         type=int, 
         help="Departure time ID (use --times to see list)"
+    )
+    journey_group.add_argument(
+        "--time-range",
+        dest="time_range_minutes",
+        type=int,
+        default=30,
+        choices=range(
+            DEPARTURE_TIME_RANGE_STEP_MINUTES,
+            MAX_DEPARTURE_TIME_RANGE_MINUTES + DEPARTURE_TIME_RANGE_STEP_MINUTES,
+            DEPARTURE_TIME_RANGE_STEP_MINUTES,
+        ),
+        help="Accepted departure range after --time, in minutes (default: 30)"
     )
     journey_group.add_argument(
         "--train", "-r",

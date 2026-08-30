@@ -6,6 +6,7 @@ import { BOOKING_STATUS } from '@/types';
 import LoadingSpinner from '@/components/ui/LoadingSpinner';
 import { formatStationRoute } from '@/utils/stations';
 import { formatDateTimeWithTimezone, getEffectiveTaskStatus } from '@/utils/dateTime';
+import { formatDepartureTimeRange } from '@/utils/timeRange';
 
 // Helper function to format passenger counts
 const formatPassengerCounts = (task: any) => {
@@ -293,6 +294,12 @@ const TasksPage: React.FC = () => {
                         <p className="text-text-muted text-sm">出發時間</p>
                         <p className="text-text-primary">
                           {formatDepartureTime(task.time, timeSlots)}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-text-muted text-sm">可接受出發範圍</p>
+                        <p className="text-text-primary">
+                          {formatDepartureTimeRange(task.time_range_minutes)}
                         </p>
                       </div>
                       <div>

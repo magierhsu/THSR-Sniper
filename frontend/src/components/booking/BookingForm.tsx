@@ -6,6 +6,7 @@ import { useNavigate } from 'react-router-dom';
 import { thsrApi } from '@/services/api';
 import { StationInfo, TimeSlotInfo, THSRInfo, BookingFormData } from '@/types';
 import LoadingSpinner from '@/components/ui/LoadingSpinner';
+import { DEPARTURE_TIME_RANGE_OPTIONS, formatDepartureTimeRange } from '@/utils/timeRange';
 
 interface BookingFormProps {
   stations: StationInfo[];
@@ -33,6 +34,7 @@ const BookingForm: React.FC<BookingFormProps> = ({ stations, timeSlots, thsrInfo
       childCount: 0,
       seniorCount: 0,
       disabledCount: 0,
+      departureTimeRangeMinutes: 30,
       seatPreference: 0,
       classType: 0,
       useOCR: true,
@@ -160,7 +162,8 @@ const BookingForm: React.FC<BookingFormProps> = ({ stations, timeSlots, thsrInfo
       ...(childTickets > 0 && { child_cnt: childTickets }),
       ...(seniorTickets > 0 && { senior_cnt: seniorTickets }),
       ...(disabledTickets > 0 && { disabled_cnt: disabledTickets }),
-      ...(data.departureTime && { time: data.departureTime }),
+      time: data.departureTime,
+      time_range_minutes: data.departureTimeRangeMinutes,
       ...(data.trainIndex && { train_index: data.trainIndex }),
       seat_prefer: data.seatPreference,
       class_type: data.classType,
@@ -315,16 +318,34 @@ const BookingForm: React.FC<BookingFormProps> = ({ stations, timeSlots, thsrInfo
 
           {/* Departure Time */}
           <div className="form-group">
-            <label htmlFor="departureTime" className="form-label">出發時間（選填）</label>
+            <label htmlFor="departureTime" className="form-label">出發時間</label>
             <select
-              {...register('departureTime')}
+              {...register('departureTime', { required: '請選擇出發時間' })}
               id="departureTime"
               className="rog-select"
             >
-              <option value="">不指定時間</option>
+              <option value="">請選擇出發時間</option>
               {timeSlots.map((slot) => (
                 <option key={slot.id} value={slot.id}>
                   {slot.formatted_time} ({slot.time})
+                </option>
+              ))}
+            </select>
+            {errors.departureTime && (
+              <p className="text-rog-danger text-sm mt-1">{errors.departureTime.message}</p>
+            )}
+          </div>
+
+          <div className="form-group">
+            <label htmlFor="departureTimeRangeMinutes" className="form-label">可接受出發範圍</label>
+            <select
+              {...register('departureTimeRangeMinutes', { required: true })}
+              id="departureTimeRangeMinutes"
+              className="rog-select"
+            >
+              {DEPARTURE_TIME_RANGE_OPTIONS.map((minutes) => (
+                <option key={minutes} value={minutes}>
+                  {formatDepartureTimeRange(minutes)}
                 </option>
               ))}
             </select>

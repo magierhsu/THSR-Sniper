@@ -77,6 +77,7 @@ class THSRApiClient:
         adult_cnt: Optional[int] = None,
         student_cnt: Optional[int] = None,
         time: Optional[int] = None,
+        time_range_minutes: int = 30,
         train_index: Optional[int] = None,
         seat_prefer: Optional[int] = None,
         class_type: Optional[int] = None,
@@ -101,6 +102,7 @@ class THSRApiClient:
             payload["student_cnt"] = student_cnt
         if time is not None:
             payload["time"] = time
+        payload["time_range_minutes"] = time_range_minutes
         if train_index is not None:
             payload["train_index"] = train_index
         if seat_prefer is not None:
@@ -307,6 +309,11 @@ def schedule_booking_via_api(args) -> None:
             print("× Error: At least one ticket type must be specified")
             print("   Example: --adult 1 or --student 2")
             return
+
+        if getattr(args, 'time', None) is None:
+            print("× Error: Departure time must be specified for scheduled booking")
+            print("   Use --times to list IDs, then pass --time <ID>")
+            return
         
         # Create the scheduled task
         result = client.create_scheduled_task(
@@ -320,6 +327,7 @@ def schedule_booking_via_api(args) -> None:
             interval_minutes=getattr(args, 'interval', 5),
             max_attempts=getattr(args, 'max_attempts', None),
             time=getattr(args, 'time', None),
+            time_range_minutes=getattr(args, 'time_range_minutes', 30),
             train_index=getattr(args, 'train_index', None),
             seat_prefer=getattr(args, 'seat_prefer', None),
             class_type=getattr(args, 'class_type', None)
