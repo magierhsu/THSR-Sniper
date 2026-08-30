@@ -77,6 +77,7 @@ export interface BookingRequest {
   time: number;
   time_range_minutes: number;
   train_index?: number;
+  preferred_train_numbers?: string[];
   seat_prefer?: number;
   class_type?: number;
   no_ocr?: boolean;
@@ -86,6 +87,8 @@ export interface ScheduledBookingRequest extends BookingRequest {
   interval_minutes: number;
   max_attempts?: number;
 }
+
+export type TaskUpdateRequest = ScheduledBookingRequest;
 
 export interface BookingResponse {
   success: boolean;
@@ -110,6 +113,11 @@ export interface TaskStatusResponse {
   time?: number;
   time_range_minutes: number;
   train_index?: number;
+  preferred_train_numbers: string[];
+  seat_prefer?: number;
+  class_type?: number;
+  no_ocr: boolean;
+  max_attempts?: number;
   adult_cnt?: number;
   student_cnt?: number;
   child_cnt?: number;
@@ -119,7 +127,7 @@ export interface TaskStatusResponse {
 
 export interface BookingTask {
   id: string;
-  status: 'pending' | 'running' | 'success' | 'failed' | 'cancelled' | 'expired' | 'waiting';
+  status: 'pending' | 'running' | 'pausing' | 'paused' | 'success' | 'failed' | 'cancelled' | 'expired' | 'waiting';
   from_station: number;
   to_station: number;
   date: string;
@@ -138,6 +146,8 @@ export interface BookingTask {
   last_attempt?: string;
   time?: number;
   time_range_minutes?: number;
+  train_index?: number;
+  preferred_train_numbers?: string[];
   seat_prefer?: number;
   class_type?: number;
   no_ocr?: boolean;
@@ -185,7 +195,7 @@ export interface BookingFormData {
   disabledCount: number;
   departureTime: number;
   departureTimeRangeMinutes: number;
-  trainIndex?: number;
+  preferredTrainNumbers: string;
   seatPreference: number;
   classType: number;
   useOCR: boolean;
@@ -236,6 +246,8 @@ export const BOOKING_STATUS = {
   waiting: '等待開票',
   pending: '等待中',
   running: '執行中',
+  pausing: '暫停中',
+  paused: '已暫停',
   success: '成功',
   failed: '失敗',
   cancelled: '已取消',

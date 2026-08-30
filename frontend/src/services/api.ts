@@ -4,7 +4,7 @@ import { isTokenExpired } from '@/utils/tokenUtils';
 import { 
   User, Token, LoginCredentials, RegisterData, UserUpdate, 
   PasswordChange, THSRInfo, StationInfo, TimeSlotInfo,
-  BookingRequest, ScheduledBookingRequest, BookingResponse,
+  BookingRequest, ScheduledBookingRequest, TaskUpdateRequest, BookingResponse,
   TaskStatusResponse, SchedulerStatus, BookingStats,
   BookingTask, PaginatedResponse
 } from '@/types';
@@ -415,6 +415,39 @@ export const thsrApi = {
   async getTask(taskId: string): Promise<TaskStatusResponse> {
     try {
       const response = await apiClient.get(`/tasks/${taskId}`);
+      return response.data;
+    } catch (error) {
+      handleApiError(error);
+      throw error;
+    }
+  },
+
+  async pauseTask(taskId: string): Promise<TaskStatusResponse> {
+    try {
+      const response = await apiClient.post(`/tasks/${taskId}/pause`);
+      return response.data;
+    } catch (error) {
+      handleApiError(error);
+      throw error;
+    }
+  },
+
+  async resumeTask(taskId: string): Promise<TaskStatusResponse> {
+    try {
+      const response = await apiClient.post(`/tasks/${taskId}/resume`);
+      return response.data;
+    } catch (error) {
+      handleApiError(error);
+      throw error;
+    }
+  },
+
+  async updateTask(
+    taskId: string,
+    bookingData: TaskUpdateRequest
+  ): Promise<TaskStatusResponse> {
+    try {
+      const response = await apiClient.put(`/tasks/${taskId}`, bookingData);
       return response.data;
     } catch (error) {
       handleApiError(error);

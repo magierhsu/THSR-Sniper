@@ -85,7 +85,7 @@ const Layout: React.FC = () => {
   const isActive = (path: string) => location.pathname === path;
 
   return (
-    <div className="min-h-screen bg-bg-primary">
+    <div className="min-h-screen bg-bg-primary flex flex-col">
       {/* Header */}
       <header className="bg-bg-card border-b border-gray-800 shadow-lg">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
@@ -204,12 +204,12 @@ const Layout: React.FC = () => {
       </header>
 
       {/* Main Content */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 pb-20">
+      <main className="w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 flex-1">
         <Outlet />
       </main>
 
       {/* Status Bar */}
-      <div className="fixed bottom-0 left-0 right-0 bg-bg-card border-t border-gray-800 px-4 py-2">
+      <footer className="bg-bg-card border-t border-gray-800 px-4 py-2">
         <div className="max-w-7xl mx-auto flex items-center justify-between text-sm">
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-2">
@@ -233,7 +233,7 @@ const Layout: React.FC = () => {
             </div>
           </div>
         </div>
-      </div>
+      </footer>
     </div>
   );
 };

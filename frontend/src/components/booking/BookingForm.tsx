@@ -7,6 +7,7 @@ import { thsrApi } from '@/services/api';
 import { StationInfo, TimeSlotInfo, THSRInfo, BookingFormData } from '@/types';
 import LoadingSpinner from '@/components/ui/LoadingSpinner';
 import { DEPARTURE_TIME_RANGE_OPTIONS, formatDepartureTimeRange } from '@/utils/timeRange';
+import { parsePreferredTrainNumbers } from '@/utils/trainPreferences';
 
 interface BookingFormProps {
   stations: StationInfo[];
@@ -35,6 +36,7 @@ const BookingForm: React.FC<BookingFormProps> = ({ stations, timeSlots, thsrInfo
       seniorCount: 0,
       disabledCount: 0,
       departureTimeRangeMinutes: 30,
+      preferredTrainNumbers: '',
       seatPreference: 0,
       classType: 0,
       useOCR: true,
@@ -85,6 +87,12 @@ const BookingForm: React.FC<BookingFormProps> = ({ stations, timeSlots, thsrInfo
     // Validate THSR personal info
     if (!thsrInfo?.personal_id) {
       toast.error('請先在個人設定中設定身分證字號');
+      return;
+    }
+
+    const preferredTrains = parsePreferredTrainNumbers(data.preferredTrainNumbers);
+    if (preferredTrains.error) {
+      toast.error(preferredTrains.error);
       return;
     }
 
@@ -164,7 +172,7 @@ const BookingForm: React.FC<BookingFormProps> = ({ stations, timeSlots, thsrInfo
       ...(disabledTickets > 0 && { disabled_cnt: disabledTickets }),
       time: data.departureTime,
       time_range_minutes: data.departureTimeRangeMinutes,
-      ...(data.trainIndex && { train_index: data.trainIndex }),
+      preferred_train_numbers: preferredTrains.values,
       seat_prefer: data.seatPreference,
       class_type: data.classType,
       no_ocr: !data.useOCR,
@@ -350,6 +358,23 @@ const BookingForm: React.FC<BookingFormProps> = ({ stations, timeSlots, thsrInfo
               ))}
             </select>
           </div>
+
+          <div className="form-group md:col-span-2">
+            <label htmlFor="preferredTrainNumbers" className="form-label">偏好車次（選填）</label>
+            <input
+              {...register('preferredTrainNumbers', {
+                validate: value => parsePreferredTrainNumbers(value).error || true,
+              })}
+              type="text"
+              id="preferredTrainNumbers"
+              className="rog-input"
+              placeholder="825, 838, 1320"
+              autoComplete="off"
+            />
+            {errors.preferredTrainNumbers && (
+              <p className="text-rog-danger text-sm mt-1">{errors.preferredTrainNumbers.message}</p>
+            )}
+          </div>
         </div>
       </div>
 
@@ -520,23 +545,6 @@ const BookingForm: React.FC<BookingFormProps> = ({ stations, timeSlots, thsrInfo
               <option value={0}>標準車廂</option>
               <option value={1}>商務車廂</option>
             </select>
-          </div>
-
-          <div className="form-group">
-            <label htmlFor="trainIndex" className="form-label">車次選擇（選填）</label>
-            <input
-              {...register('trainIndex', {
-                min: { value: 1, message: '車次索引必須大於0' }
-              })}
-              type="number"
-              id="trainIndex"
-              min="1"
-              className="rog-input"
-              placeholder="不指定"
-            />
-            {errors.trainIndex && (
-              <p className="text-rog-danger text-sm mt-1">{errors.trainIndex.message}</p>
-            )}
           </div>
 
           <div className="form-group">
