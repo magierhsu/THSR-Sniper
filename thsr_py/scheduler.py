@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import io
+import multiprocessing
 import time
 import uuid
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -14,7 +18,49 @@ import fcntl
 import os
 
 from .flows import run as run_booking_flow
-from .schema import MAX_DEPARTURE_TIME_RANGE_MINUTES, STATION_MAP, TIME_TABLE, TicketType, is_ticket_sales_open, get_taiwan_now
+from .schema import (
+    MAX_DEPARTURE_TIME_RANGE_MINUTES,
+    STATION_MAP,
+    TIME_TABLE,
+    TicketType,
+    get_taiwan_now,
+    is_ticket_sales_open,
+)
+
+
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return min(max(value, minimum), maximum)
+
+
+def _booking_worker_ready() -> int:
+    """Warm a booking worker and return its process ID."""
+    return os.getpid()
+
+
+def _run_booking_flow_worker(args) -> tuple[str, str, Optional[str]]:
+    """Run one booking flow in an isolated process."""
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    original_non_interactive = os.environ.get("THSR_NON_INTERACTIVE")
+    error = None
+
+    try:
+        os.environ["THSR_NON_INTERACTIVE"] = "1"
+        with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+            run_booking_flow(args)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    finally:
+        if original_non_interactive is None:
+            os.environ.pop("THSR_NON_INTERACTIVE", None)
+        else:
+            os.environ["THSR_NON_INTERACTIVE"] = original_non_interactive
+
+    return stdout_buffer.getvalue(), stderr_buffer.getvalue(), error
 
 
 class BookingStatus(Enum):
@@ -206,6 +252,16 @@ class BookingScheduler:
         self.tasks: Dict[str, BookingTask] = {}
         self.running = False
         self.scheduler_thread: Optional[threading.Thread] = None
+        self.max_concurrent_bookings = _bounded_env_int(
+            "THSR_MAX_CONCURRENT_BOOKINGS", 2, 1, 4
+        )
+        self.poll_interval_seconds = _bounded_env_int(
+            "THSR_SCHEDULER_POLL_SECONDS", 1, 1, 30
+        )
+        self._booking_executor: Optional[ProcessPoolExecutor] = None
+        self._stop_event = threading.Event()
+        self._state_lock = threading.RLock()
+        self._executor_lock_handle = None
         self.logger = self._setup_logger()
         
         # Initialize file modification time tracking
@@ -318,8 +374,48 @@ class BookingScheduler:
                         pass
         else:
             self.logger.debug(f"No storage file found at {self.storage_path}, starting with empty task list")
+
+    def _acquire_executor_lock(self) -> bool:
+        """Ensure only one process executes booking tasks for a shared data file."""
+        if not self.enable_persistence or not self.storage_path:
+            return True
+        if self._executor_lock_handle is not None:
+            return True
+
+        lock_path = self.storage_path.with_suffix('.executor.lock')
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_handle = open(lock_path, 'a+')
+
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_handle.close()
+            return False
+
+        lock_handle.seek(0)
+        lock_handle.truncate()
+        lock_handle.write(str(os.getpid()))
+        lock_handle.flush()
+        self._executor_lock_handle = lock_handle
+        return True
+
+    def _release_executor_lock(self) -> None:
+        """Release the process-wide booking executor lock."""
+        if self._executor_lock_handle is None:
+            return
+
+        try:
+            fcntl.flock(self._executor_lock_handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._executor_lock_handle.close()
+            self._executor_lock_handle = None
     
     def _save_tasks(self) -> None:
+        """Serialize in-process writers before updating shared task storage."""
+        with self._state_lock:
+            self._save_tasks_locked()
+
+    def _save_tasks_locked(self) -> None:
         """Save tasks to storage file with simplified locking."""
         if not self.enable_persistence or not self.storage_path:
             return
@@ -442,37 +538,89 @@ class BookingScheduler:
             return True
         return False
     
-    def start_scheduler(self) -> None:
+    def start_scheduler(self) -> bool:
         """Start the scheduler in a background thread."""
         if self.running:
             self.logger.warning("Scheduler is already running")
-            return
-        
+            return True
+        if self.scheduler_thread and self.scheduler_thread.is_alive():
+            self.logger.warning("Previous scheduler thread is still stopping")
+            return False
+
+        if not self._acquire_executor_lock():
+            self.logger.warning(
+                "Scheduler executor lock is held by another process; "
+                "this process will not execute booking tasks"
+            )
+            return False
+
+        try:
+            worker_context = multiprocessing.get_context("spawn")
+            self._booking_executor = ProcessPoolExecutor(
+                max_workers=self.max_concurrent_bookings,
+                mp_context=worker_context,
+            )
+            warmup_futures = [
+                self._booking_executor.submit(_booking_worker_ready)
+                for _ in range(self.max_concurrent_bookings)
+            ]
+            for future in warmup_futures:
+                future.result(timeout=30)
+        except Exception as exc:
+            self.logger.error(f"Failed to initialize booking workers: {exc}")
+            if self._booking_executor is not None:
+                self._booking_executor.shutdown(wait=False, cancel_futures=True)
+                self._booking_executor = None
+            self._release_executor_lock()
+            return False
+
+        self._stop_event.clear()
         self.running = True
         self.scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
         self.scheduler_thread.start()
-        self.logger.info("Scheduler started")
+        self.logger.info(
+            "Scheduler started with %s booking workers and a %ss poll interval",
+            self.max_concurrent_bookings,
+            self.poll_interval_seconds,
+        )
+        return True
     
     def stop_scheduler(self) -> None:
         """Stop the scheduler."""
         self.running = False
+        self._stop_event.set()
         if self.scheduler_thread and self.scheduler_thread.is_alive():
-            self.scheduler_thread.join(timeout=5)
+            self.scheduler_thread.join(timeout=30)
+        if not self.scheduler_thread or not self.scheduler_thread.is_alive():
+            self._release_executor_lock()
+        else:
+            self.logger.warning("Scheduler is waiting for active booking workers to finish")
         self.logger.info("Scheduler stopped")
     
     def _scheduler_loop(self) -> None:
         """Main scheduler loop that runs in background."""
-        while self.running:
-            try:
-                self._process_tasks()
-                time.sleep(30)  # Check every 30 seconds
-            except Exception as e:
-                self.logger.error(f"Error in scheduler loop: {e}")
-                time.sleep(60)  # Wait longer on error
+        try:
+            while self.running:
+                try:
+                    self._process_tasks()
+                    if self._stop_event.wait(self.poll_interval_seconds):
+                        break
+                except Exception as e:
+                    self.logger.error(f"Error in scheduler loop: {e}")
+                    if self._stop_event.wait(5):
+                        break
+        finally:
+            self.running = False
+            if self._booking_executor is not None:
+                self._booking_executor.shutdown(wait=True, cancel_futures=False)
+                self._booking_executor = None
+            self._release_executor_lock()
     
     def _process_tasks(self) -> None:
         """Process all pending tasks."""
         current_time = datetime.now(timezone.utc)
+        due_tasks = []
+        state_changed = False
         
         for task in list(self.tasks.values()):
             if task.status in [BookingStatus.SUCCESS, BookingStatus.CANCELLED, BookingStatus.DELETED]:
@@ -481,6 +629,7 @@ class BookingScheduler:
             # Check if task is expired
             if task.is_expired():
                 task.status = BookingStatus.EXPIRED
+                state_changed = True
                 self.logger.info(f"Task {task.id} expired")
                 continue
             
@@ -488,6 +637,7 @@ class BookingScheduler:
             if task.should_stop():
                 task.status = BookingStatus.FAILED
                 task.error_message = "Maximum attempts reached"
+                state_changed = True
                 self.logger.info(f"Task {task.id} stopped after {task.attempts} attempts")
                 continue
             
@@ -495,12 +645,14 @@ class BookingScheduler:
             if not is_ticket_sales_open(task.date):
                 if task.status != BookingStatus.WAITING:
                     task.status = BookingStatus.WAITING
+                    state_changed = True
                     self.logger.info(f"Task {task.id} waiting for ticket sales to open at 00:00 Taiwan time")
                 continue
             
             # If task was waiting and ticket sales are now open, change to pending
             if task.status == BookingStatus.WAITING:
                 task.status = BookingStatus.PENDING
+                state_changed = True
                 self.logger.info(f"Task {task.id} ticket sales now open, resuming booking attempts")
             
             # Check if it's time to run this task
@@ -516,15 +668,17 @@ class BookingScheduler:
                 should_run = time_since_last >= timedelta(minutes=task.interval_minutes)
             
             if should_run:
-                self._execute_booking_task(task)
+                due_tasks.append(task)
+
+        if due_tasks:
+            self._execute_booking_tasks(due_tasks, current_time)
+        elif state_changed:
+            self._save_tasks()
         
         # Periodically clean up old deleted tasks (every hour)
         self._cleanup_deleted_tasks(current_time)
         
-        # Only save if there were any changes in this cycle
-        # _execute_booking_task already saves its changes, so we don't need to save again
-        # This prevents unnecessary merge conflicts
-        # self._save_tasks_safe()  # Commented out to prevent SUCCESS status overwrites
+        # Booking task state is saved before dispatch and after each worker result.
     
     def _cleanup_deleted_tasks(self, current_time: datetime) -> None:
         """Clean up tasks that have been marked as deleted for more than 1 hour."""
@@ -586,115 +740,120 @@ class BookingScheduler:
         
         self._save_tasks()
     
-    def _execute_booking_task(self, task: BookingTask) -> None:
-        """Execute a single booking task."""
-        # Store original values for rollback if needed
-        original_status = task.status
-        original_attempts = task.attempts
-        original_last_attempt = task.last_attempt
-        
-        # Update task status and attempt info with timezone-aware datetime
-        task.status = BookingStatus.RUNNING
-        task.last_attempt = datetime.now(timezone.utc)
-        task.attempts += 1
-        
-        self.logger.info(f"Executing task {task.id} (attempt {task.attempts})")
-        
-        # Save immediately after updating attempt count
-        try:
-            self._save_tasks()
-        except Exception as save_error:
-            self.logger.error(f"Failed to save task state before execution: {save_error}")
+    def _execute_booking_tasks(
+        self, tasks: List[BookingTask], attempt_time: datetime
+    ) -> None:
+        """Dispatch due tasks to the bounded isolated worker pool."""
+        if self._booking_executor is None:
+            self.logger.error("Booking worker pool is not available")
+            return
 
-        # Store environment variable for restoration
-        original_non_interactive = None
-        
-        try:
-            # Convert task to args namespace
-            args = task.to_args_namespace()
-            
-            # Capture the booking flow output to detect success
-            import io
-            import sys
-            import os
-            from contextlib import redirect_stdout, redirect_stderr
-            
-            # Set environment variable to indicate non-interactive mode
-            original_non_interactive = os.environ.get('THSR_NON_INTERACTIVE')
-            os.environ['THSR_NON_INTERACTIVE'] = '1'
-            
-            # Create string buffers to capture output
-            stdout_buffer = io.StringIO()
-            stderr_buffer = io.StringIO()
-            
-            # Redirect stdout and stderr to capture output
-            with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
-                run_booking_flow(args)
-            
-            # Check if booking was successful by looking for PNR in output
-            output = stdout_buffer.getvalue()
-            stderr_output = stderr_buffer.getvalue()
-            
-            self.logger.debug(f"Task {task.id} output length: stdout={len(output)}, stderr={len(stderr_output)}")
-            
-            if "PNR Code:" in output:
-                # Extract PNR code
-                lines = output.split('\n')
-                for line in lines:
-                    if "PNR Code:" in line:
-                        pnr = line.split("PNR Code:")[-1].strip()
-                        # Clean ANSI color codes from PNR
-                        import re
-                        pnr = re.sub(r'\033\[[0-9;]*m', '', pnr).strip()
-                        task.success_pnr = pnr
-                        break
-                
-                task.status = BookingStatus.SUCCESS
-                self.logger.info(f"Task {task.id} completed successfully! PNR: {task.success_pnr}")
-                self.logger.info(f"Task {task.id} STATUS SET TO SUCCESS - about to save...")
-            else:
-                # Check for error messages in output
-                if stderr_output:
-                    task.error_message = stderr_output.strip()[:500]  # Limit error message length
-                elif "Error" in output or "error" in output.lower():
-                    # Look for error patterns in stdout
-                    error_lines = [line for line in output.split('\n') if 'error' in line.lower() or 'Error' in line]
-                    if error_lines:
-                        task.error_message = '; '.join(error_lines[:3])[:500]
-                    else:
-                        task.error_message = "Booking failed - no PNR code found"
-                else:
-                    task.error_message = "Booking failed - no PNR code found"
-                
-                # Only set to PENDING if task is not already SUCCESS (shouldn't happen but safety check)
-                if task.status != BookingStatus.SUCCESS:
-                    task.status = BookingStatus.PENDING  # Will retry on next cycle
-                self.logger.warning(f"Task {task.id} attempt {task.attempts} failed: {task.error_message}")
-            
-        except Exception as e:
-            # Only override status if it's not already SUCCESS
-            if task.status != BookingStatus.SUCCESS:
-                task.error_message = f"Booking execution error: {str(e)}"[:500]
-                task.status = BookingStatus.PENDING  # Will retry on next cycle
-            self.logger.error(f"Task {task.id} failed with exception: {e}")
-            import traceback
-            self.logger.debug(f"Task {task.id} traceback: {traceback.format_exc()}")
-        
-        finally:
-            # Restore original environment variable
-            if original_non_interactive is None:
-                os.environ.pop('THSR_NON_INTERACTIVE', None)
-            else:
-                os.environ['THSR_NON_INTERACTIVE'] = original_non_interactive
-                
-            # Always save the final state
+        future_to_task = {}
+        for task in tasks:
+            if task.status in [
+                BookingStatus.SUCCESS,
+                BookingStatus.CANCELLED,
+                BookingStatus.DELETED,
+            ]:
+                continue
+
+            task.status = BookingStatus.RUNNING
+            task.last_attempt = attempt_time
+            task.attempts += 1
+            self.logger.info(f"Executing task {task.id} (attempt {task.attempts})")
+
             try:
-                self.logger.info(f"Task {task.id} FINAL SAVE - status={task.status.value}, pnr={task.success_pnr}")
-                # Save the task state
-                self._save_tasks()
-                self.logger.info(f"Task {task.id} SAVE COMPLETED - status={task.status.value}, attempts={task.attempts}")
-            except Exception as save_error:
-                self.logger.error(f"Failed to save task state after execution: {save_error}")
+                future = self._booking_executor.submit(
+                    _run_booking_flow_worker, task.to_args_namespace()
+                )
+                future_to_task[future] = task
+            except Exception as exc:
+                task.status = BookingStatus.PENDING
+                task.error_message = f"Booking worker submission error: {exc}"[:500]
+                self.logger.error(
+                    f"Task {task.id} could not be submitted to a worker: {exc}"
+                )
+
+        self._save_tasks()
+
+        for future in as_completed(future_to_task):
+            task = future_to_task[future]
+            try:
+                output, stderr_output, worker_error = future.result()
+            except Exception as exc:
+                output = ""
+                stderr_output = ""
+                worker_error = f"{type(exc).__name__}: {exc}"
+
+            self._apply_booking_result(
+                task, output, stderr_output, worker_error
+            )
+            self.logger.info(
+                f"Task {task.id} FINAL SAVE - status={task.status.value}, "
+                f"pnr={task.success_pnr}"
+            )
+            self._save_tasks()
+            self.logger.info(
+                f"Task {task.id} SAVE COMPLETED - status={task.status.value}, "
+                f"attempts={task.attempts}"
+            )
+
+    def _apply_booking_result(
+        self,
+        task: BookingTask,
+        output: str,
+        stderr_output: str,
+        worker_error: Optional[str],
+    ) -> None:
+        """Apply one isolated worker result to its booking task."""
+        self.logger.debug(
+            f"Task {task.id} output length: stdout={len(output)}, "
+            f"stderr={len(stderr_output)}"
+        )
+
+        if "PNR Code:" in output:
+            import re
+
+            for line in output.split("\n"):
+                if "PNR Code:" in line:
+                    pnr = line.split("PNR Code:")[-1].strip()
+                    task.success_pnr = re.sub(r"\033\[[0-9;]*m", "", pnr).strip()
+                    break
+
+            task.status = BookingStatus.SUCCESS
+            task.error_message = None
+            self.logger.info(
+                f"Task {task.id} completed successfully! PNR: {task.success_pnr}"
+            )
+            return
+
+        if task.status in [BookingStatus.CANCELLED, BookingStatus.DELETED]:
+            self.logger.info(
+                f"Task {task.id} finished after being {task.status.value}; "
+                "preserving its current status"
+            )
+            return
+
+        if worker_error:
+            task.error_message = f"Booking execution error: {worker_error}"[:500]
+        elif stderr_output:
+            task.error_message = stderr_output.strip()[:500]
+        elif "error" in output.lower():
+            error_lines = [
+                line for line in output.split("\n") if "error" in line.lower()
+            ]
+            task.error_message = (
+                "; ".join(error_lines[:3])[:500]
+                if error_lines
+                else "Booking failed - no PNR code found"
+            )
+        else:
+            task.error_message = "Booking failed - no PNR code found"
+
+        task.status = BookingStatus.PENDING
+        self.logger.warning(
+            f"Task {task.id} attempt {task.attempts} failed: {task.error_message}"
+        )
 
 
 # Global scheduler instance

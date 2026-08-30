@@ -16,22 +16,7 @@ services:
     networks:
       - default
 
-  # Background scheduler service
-  thsr-sniper-scheduler:
-    build: .
-    image: seanchangx/thsr-sniper:latest
-    container_name: thsr-sniper-scheduler
-    volumes:
-      - data:/app/data
-    environment:
-      - PYTHONUNBUFFERED=1
-      - TERM=xterm-256color
-    restart: unless-stopped
-    command: python watchdog.py
-    networks:
-      - default
-
-  # THSR Booking API service
+  # THSR Booking API and sole scheduler service
   thsr-sniper-api:
     build: .
     image: seanchangx/thsr-sniper:latest
@@ -43,12 +28,12 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - THSR_API_MODE=1
+      - THSR_MAX_CONCURRENT_BOOKINGS=2
+      - THSR_SCHEDULER_POLL_SECONDS=1
     restart: unless-stopped
     command: python main.py --start-api --api-host 0.0.0.0 --api-port 8000
     networks:
       - default
-    depends_on:
-      - thsr-sniper-scheduler
 
   # MySQL Database
   mysql:

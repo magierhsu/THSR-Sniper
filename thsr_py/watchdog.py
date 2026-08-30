@@ -79,8 +79,10 @@ class SchedulerWatchdog:
         
         # Start the scheduler if not already running
         if not self.scheduler.running:
-            self.scheduler.start_scheduler()
-            self.logger.info("Started booking scheduler")
+            if self.scheduler.start_scheduler():
+                self.logger.info("Started booking scheduler")
+            else:
+                self.logger.warning("Another process owns the booking scheduler lock")
         
         # Display initial status
         self._print_startup_status()
@@ -95,7 +97,7 @@ class SchedulerWatchdog:
                 
                 # Monitor scheduler health
                 if not self.scheduler.running:
-                    self.logger.warning("Scheduler appears to be stopped, restarting...")
+                    self.logger.warning("Scheduler is not active in this process, retrying lock...")
                     self.scheduler.start_scheduler()
                 
                 # Periodic status report
