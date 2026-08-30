@@ -14,6 +14,7 @@ MYSQL_USER = os.getenv("MYSQL_USER", "user")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "password")
 
 DATABASE_URL = f"mysql+pymysql://{MYSQL_USER}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE}"
+DATABASE_TARGET = f"{MYSQL_USER}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE}"
 
 # Create engine with proper MySQL configuration
 engine = create_engine(
@@ -100,7 +101,8 @@ def wait_for_database(max_retries=30, delay=2):
     for attempt in range(max_retries):
         try:
             # Test connection
-            engine.connect()
+            with engine.connect():
+                pass
             print(f"Database connection successful on attempt {attempt + 1}")
             return True
         except Exception as e:
@@ -116,10 +118,10 @@ def wait_for_database(max_retries=30, delay=2):
 
 def init_database():
     """Initialize database with tables"""
-    print(f"Attempting to connect to database: {DATABASE_URL}")
+    print(f"Attempting to connect to database: {DATABASE_TARGET}")
     wait_for_database()
     create_tables()
-    print(f"Database initialized at: {DATABASE_URL}")
+    print(f"Database initialized at: {DATABASE_TARGET}")
 
 
 if __name__ == "__main__":
