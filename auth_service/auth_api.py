@@ -17,6 +17,12 @@ from security import (
     calculate_lockout_time, sanitize_user_input, validate_taiwan_id,
     Token, TokenData
 )
+from booking_preferences import (
+    BookingPreferences,
+    BookingPreferencesResponse,
+    merge_booking_preferences,
+    read_booking_preferences,
+)
 
 # Initialize database
 init_database()
@@ -461,6 +467,44 @@ async def update_user_profile(
         created_at=current_user.created_at,
         thsr_use_membership=current_user.thsr_use_membership,
         has_thsr_id=bool(current_user.thsr_personal_id)
+    )
+
+
+@app.get("/me/booking-preferences", response_model=BookingPreferencesResponse)
+async def get_booking_preferences(
+    current_user: User = Depends(get_current_user),
+):
+    """Get the current user's most recently saved booking form values."""
+    return BookingPreferencesResponse(
+        preferences=read_booking_preferences(current_user.preferences)
+    )
+
+
+@app.put("/me/booking-preferences", response_model=BookingPreferencesResponse)
+async def update_booking_preferences(
+    preferences: BookingPreferences,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_database),
+):
+    """Merge validated booking form values into the current user's preferences."""
+    current_user.preferences = merge_booking_preferences(
+        current_user.preferences, preferences
+    )
+    current_user.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    log_user_action(
+        db,
+        current_user.id,
+        "BOOKING_PREFERENCES_UPDATED",
+        "user",
+        "Saved booking form preferences",
+        request,
+    )
+
+    return BookingPreferencesResponse(
+        preferences=preferences.model_dump(mode="json")
     )
 
 
