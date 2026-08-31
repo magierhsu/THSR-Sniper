@@ -3,7 +3,8 @@ import { toast } from 'react-toastify';
 import { isTokenExpired } from '@/utils/tokenUtils';
 import { 
   User, Token, LoginCredentials, RegisterData, UserUpdate, 
-  PasswordChange, THSRInfo, StationInfo, TimeSlotInfo,
+  PasswordChange, THSRInfo, BookingPreferences, BookingPreferencesResponse,
+  StationInfo, TimeSlotInfo,
   BookingRequest, ScheduledBookingRequest, TaskUpdateRequest, BookingResponse,
   TaskStatusResponse, SchedulerStatus, BookingStats,
   BookingTask, PaginatedResponse
@@ -351,6 +352,28 @@ export const authApi = {
       return response.data;
     } catch (error) {
       handleApiError(error);
+      throw error;
+    }
+  },
+
+  async getBookingPreferences(): Promise<BookingPreferencesResponse> {
+    try {
+      const response = await authClient.get('/me/booking-preferences');
+      return response.data;
+    } catch (error) {
+      handleApiError(error, false);
+      throw error;
+    }
+  },
+
+  async updateBookingPreferences(
+    preferences: BookingPreferences
+  ): Promise<BookingPreferencesResponse> {
+    try {
+      const response = await authClient.put('/me/booking-preferences', preferences);
+      return response.data;
+    } catch (error) {
+      handleApiError(error, false);
       throw error;
     }
   },

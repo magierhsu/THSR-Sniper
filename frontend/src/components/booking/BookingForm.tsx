@@ -1,22 +1,47 @@
 import React, { useState } from 'react';
 import { useForm } from 'react-hook-form';
-import { useMutation } from 'react-query';
+import { useMutation, useQueryClient } from 'react-query';
 import { toast } from 'react-toastify';
 import { useNavigate } from 'react-router-dom';
-import { thsrApi } from '@/services/api';
-import { StationInfo, TimeSlotInfo, THSRInfo, BookingFormData } from '@/types';
+import { authApi, thsrApi } from '@/services/api';
+import {
+  BookingPreferences,
+  BookingRequest,
+  ScheduledBookingRequest,
+  StationInfo,
+  TimeSlotInfo,
+  THSRInfo,
+  BookingFormData,
+} from '@/types';
 import LoadingSpinner from '@/components/ui/LoadingSpinner';
 import { DEPARTURE_TIME_RANGE_OPTIONS, formatDepartureTimeRange } from '@/utils/timeRange';
 import { parsePreferredTrainNumbers } from '@/utils/trainPreferences';
+import {
+  buildBookingFormDefaults,
+  buildBookingPreferences,
+  getTaiwanToday,
+} from '@/utils/bookingPreferences';
 
 interface BookingFormProps {
   stations: StationInfo[];
   timeSlots: TimeSlotInfo[];
   thsrInfo: THSRInfo | null | undefined;
+  bookingPreferences: Partial<BookingPreferences> | null | undefined;
 }
 
-const BookingForm: React.FC<BookingFormProps> = ({ stations, timeSlots, thsrInfo }) => {
+interface BookingMutationVariables<T> {
+  request: T;
+  preferences: BookingPreferences;
+}
+
+const BookingForm: React.FC<BookingFormProps> = ({
+  stations,
+  timeSlots,
+  thsrInfo,
+  bookingPreferences,
+}) => {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   // Temporarily hide booking mode selection, use only scheduled booking
   const [bookingMode] = useState<'immediate' | 'scheduled'>('scheduled');
   
@@ -26,22 +51,11 @@ const BookingForm: React.FC<BookingFormProps> = ({ stations, timeSlots, thsrInfo
     watch,
     formState: { errors },
   } = useForm<BookingFormData>({
-    defaultValues: {
-      fromStation: 1,
-      toStation: 2,
-      date: new Date().toISOString().split('T')[0],
-      adultCount: 1,
-      studentCount: 0,
-      childCount: 0,
-      seniorCount: 0,
-      disabledCount: 0,
-      departureTimeRangeMinutes: 30,
-      preferredTrainNumbers: '',
-      seatPreference: 0,
-      classType: 0,
-      useOCR: true,
-      intervalMinutes: 5,
-    },
+    defaultValues: buildBookingFormDefaults(
+      bookingPreferences,
+      stations,
+      timeSlots,
+    ),
     mode: 'onChange', // Enable real-time validation
   });
 
@@ -54,34 +68,65 @@ const BookingForm: React.FC<BookingFormProps> = ({ stations, timeSlots, thsrInfo
   const fromStation = watch('fromStation');
 
   // Immediate booking mutation
-  const immediateBookingMutation = useMutation(thsrApi.immediateBooking, {
-    onSuccess: (response) => {
-      if (response.success) {
-        toast.success(`訂票成功！PNR代碼：${response.pnr_code}`);
-        navigate('/tasks');
-      } else {
-        toast.error(`訂票失敗：${response.message}`);
-      }
-    },
-    onError: (error: any) => {
-      toast.error(`訂票失敗：${error.message}`);
-    },
-  });
+  const savePreferencesAndNavigate = async (
+    preferences: BookingPreferences,
+    successMessage: string,
+  ) => {
+    let saved = true;
+    try {
+      await authApi.updateBookingPreferences(preferences);
+      queryClient.setQueryData('bookingPreferences', { preferences });
+    } catch {
+      saved = false;
+    }
+
+    toast.success(successMessage);
+    if (!saved) {
+      toast.warning('任務已建立，但上次設定未儲存');
+    }
+    navigate('/tasks');
+  };
+
+  const immediateBookingMutation = useMutation(
+    ({ request }: BookingMutationVariables<BookingRequest>) =>
+      thsrApi.immediateBooking(request),
+    {
+      onSuccess: async (response, variables) => {
+        if (response.success) {
+          await savePreferencesAndNavigate(
+            variables.preferences,
+            `訂票成功！PNR代碼：${response.pnr_code}`,
+          );
+        } else {
+          toast.error(`訂票失敗：${response.message}`);
+        }
+      },
+      onError: (error: any) => {
+        toast.error(`訂票失敗：${error.message}`);
+      },
+    }
+  );
 
   // Scheduled booking mutation
-  const scheduledBookingMutation = useMutation(thsrApi.scheduleBooking, {
-    onSuccess: (response) => {
-      if (response.success) {
-        toast.success(`排程訂票已建立！任務ID：${response.task_id}`);
-        navigate('/tasks');
-      } else {
-        toast.error(`建立排程失敗：${response.message}`);
-      }
-    },
-    onError: (error: any) => {
-      toast.error(`建立排程失敗：${error.message}`);
-    },
-  });
+  const scheduledBookingMutation = useMutation(
+    ({ request }: BookingMutationVariables<ScheduledBookingRequest>) =>
+      thsrApi.scheduleBooking(request),
+    {
+      onSuccess: async (response, variables) => {
+        if (response.success) {
+          await savePreferencesAndNavigate(
+            variables.preferences,
+            `排程訂票已建立！任務ID：${response.task_id}`,
+          );
+        } else {
+          toast.error(`建立排程失敗：${response.message}`);
+        }
+      },
+      onError: (error: any) => {
+        toast.error(`建立排程失敗：${error.message}`);
+      },
+    }
+  );
 
   const onSubmit = (data: BookingFormData) => {
     // Validate THSR personal info
@@ -131,11 +176,7 @@ const BookingForm: React.FC<BookingFormProps> = ({ stations, timeSlots, thsrInfo
     }
 
     // Validate date
-    const selectedDate = new Date(data.date);
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    
-    if (selectedDate < today) {
+    if (data.date < getTaiwanToday()) {
       toast.error('不能選擇過去的日期');
       return;
     }
@@ -170,23 +211,24 @@ const BookingForm: React.FC<BookingFormProps> = ({ stations, timeSlots, thsrInfo
       ...(childTickets > 0 && { child_cnt: childTickets }),
       ...(seniorTickets > 0 && { senior_cnt: seniorTickets }),
       ...(disabledTickets > 0 && { disabled_cnt: disabledTickets }),
-      time: data.departureTime,
-      time_range_minutes: data.departureTimeRangeMinutes,
+      time: Number(data.departureTime),
+      time_range_minutes: Number(data.departureTimeRangeMinutes),
       preferred_train_numbers: preferredTrains.values,
-      seat_prefer: data.seatPreference,
-      class_type: data.classType,
+      seat_prefer: Number(data.seatPreference),
+      class_type: Number(data.classType),
       no_ocr: !data.useOCR,
     };
+    const preferences = buildBookingPreferences(data, preferredTrains.values);
 
     if (bookingMode === 'immediate') {
-      immediateBookingMutation.mutate(bookingData);
+      immediateBookingMutation.mutate({ request: bookingData, preferences });
     } else {
       const scheduledData = {
         ...bookingData,
-        interval_minutes: data.intervalMinutes,
-        max_attempts: data.maxAttempts || undefined,
+        interval_minutes: Number(data.intervalMinutes),
+        max_attempts: data.maxAttempts ? Number(data.maxAttempts) : undefined,
       };
-      scheduledBookingMutation.mutate(scheduledData);
+      scheduledBookingMutation.mutate({ request: scheduledData, preferences });
     }
   };
 
@@ -309,10 +351,7 @@ const BookingForm: React.FC<BookingFormProps> = ({ stations, timeSlots, thsrInfo
               {...register('date', { 
                 required: '請選擇出發日期',
                 validate: value => {
-                  const selectedDate = new Date(value);
-                  const today = new Date();
-                  today.setHours(0, 0, 0, 0);
-                  return selectedDate >= today || '不能選擇過去的日期';
+                  return value >= getTaiwanToday() || '不能選擇過去的日期';
                 }
               })}
               type="date"

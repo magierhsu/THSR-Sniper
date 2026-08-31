@@ -3,6 +3,7 @@ import { useQuery } from 'react-query';
 import { thsrApi, authApi } from '@/services/api';
 import BookingForm from './BookingForm';
 import LoadingSpinner from '@/components/ui/LoadingSpinner';
+import { toast } from 'react-toastify';
 
 const BookingPage: React.FC = () => {
   // Fetch required data
@@ -21,7 +22,21 @@ const BookingPage: React.FC = () => {
     authApi.getTHSRInfo
   );
 
-  const isLoading = stationsLoading || timeSlotsLoading || thsrInfoLoading;
+  const { data: bookingPreferences, isLoading: preferencesLoading } = useQuery(
+    'bookingPreferences',
+    authApi.getBookingPreferences,
+    {
+      retry: false,
+      onError: () => {
+        toast.warning('無法載入上次設定，已使用系統預設值');
+      },
+    }
+  );
+
+  const isLoading = stationsLoading
+    || timeSlotsLoading
+    || thsrInfoLoading
+    || preferencesLoading;
 
   if (isLoading) {
     return (
@@ -53,6 +68,7 @@ const BookingPage: React.FC = () => {
         stations={stations || []}
         timeSlots={timeSlots || []}
         thsrInfo={thsrInfo}
+        bookingPreferences={bookingPreferences?.preferences}
       />
 
       {/* Instructions */}

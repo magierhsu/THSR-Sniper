@@ -51,6 +51,30 @@ export interface THSRInfo {
   use_membership: boolean;
 }
 
+export interface BookingPreferences {
+  version: 1;
+  from_station: number;
+  to_station: number;
+  date: string;
+  adult_cnt: number;
+  student_cnt: number;
+  child_cnt: number;
+  senior_cnt: number;
+  disabled_cnt: number;
+  time: number;
+  time_range_minutes: number;
+  preferred_train_numbers: string[];
+  seat_prefer: number;
+  class_type: number;
+  no_ocr: boolean;
+  interval_minutes: number;
+  max_attempts: number | null;
+}
+
+export interface BookingPreferencesResponse {
+  preferences: Partial<BookingPreferences> | null;
+}
+
 // THSR Booking Types
 export interface StationInfo {
   id: number;
