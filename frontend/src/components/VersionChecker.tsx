@@ -37,17 +37,30 @@ const VersionChecker: React.FC<VersionCheckerProps> = ({ onUpdateDetected }) => 
             });
           }
           
-          // Clear localStorage except essential data
+          // Preserve the active session while clearing stale build data.
           const essentialData = {
-            build_time: currentBuildTime
+            build_time: currentBuildTime,
+            authStorage: localStorage.getItem('auth-storage'),
+            authToken: localStorage.getItem('auth_token'),
+            refreshToken: localStorage.getItem('refresh_token'),
+            notificationHistory: localStorage.getItem('notificationHistory'),
           };
           
           localStorage.clear();
           
-          // Restore essential data
-          Object.entries(essentialData).forEach(([key, value]) => {
-            localStorage.setItem(key, value);
-          });
+          localStorage.setItem('build_time', essentialData.build_time);
+          if (essentialData.authStorage) {
+            localStorage.setItem('auth-storage', essentialData.authStorage);
+          }
+          if (essentialData.authToken) {
+            localStorage.setItem('auth_token', essentialData.authToken);
+          }
+          if (essentialData.refreshToken) {
+            localStorage.setItem('refresh_token', essentialData.refreshToken);
+          }
+          if (essentialData.notificationHistory) {
+            localStorage.setItem('notificationHistory', essentialData.notificationHistory);
+          }
           
           // Force reload
           window.location.reload();
