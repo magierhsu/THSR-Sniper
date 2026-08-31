@@ -8,6 +8,7 @@ services:
       - PYTHONUNBUFFERED=1
       - DISPLAY=${DISPLAY:-:0}
       - TERM=xterm-256color
+      - THSR_BROWSER_IMPERSONATE=${THSR_BROWSER_IMPERSONATE:-firefox}
       - THSR_FORCE_INTERACTIVE=1  # Force interactive mode for pure CLI usage
     stdin_open: true
     tty: true
@@ -28,6 +29,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - THSR_API_MODE=1
+      - THSR_BROWSER_IMPERSONATE=${THSR_BROWSER_IMPERSONATE:-firefox}
       - THSR_MAX_CONCURRENT_BOOKINGS=2
       - THSR_SCHEDULER_POLL_SECONDS=1
     restart: unless-stopped

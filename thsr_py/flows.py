@@ -7,8 +7,15 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
-import requests
 from bs4 import BeautifulSoup
+from curl_cffi import requests
+
+from .booking_session import (
+    BASE_URL,
+    BOOKING_PAGE_URL,
+    create_booking_session,
+    establish_booking_session,
+)
 
 from .schema import (
     STATION_MAP,
@@ -19,8 +26,6 @@ from .schema import (
     normalize_preferred_train_numbers,
 )
 
-BASE_URL = "https://irs.thsrc.com.tw"
-BOOKING_PAGE_URL = f"{BASE_URL}/IMINT/?locale=tw"
 SUBMIT_FORM_URL = (
     "https://irs.thsrc.com.tw/IMINT/;jsessionid={}?wicket:interface=:0:BookingS1Form::IFormSubmitListener"
 )
@@ -94,43 +99,6 @@ def _print_section(title: str) -> None:
     print(f"\n{'-'*40}")
     print(f"  {title}")
     print(f"{'-'*40}")
-
-
-def _headers() -> Dict[str, str]:
-    import random
-    import time
-    import uuid
-    
-    # Generate unique session-like identifiers for each request
-    session_id = f"{random.randint(100000, 999999)}_{int(time.time())}"
-    device_id = str(uuid.uuid4())[:8]
-    browser_version = f"137.{random.randint(0, 9)}"
-    
-    # Randomize some header values to simulate different users/devices
-    windows_versions = ["10.0", "11.0"]
-    firefox_versions = [f"137.{random.randint(0, 9)}", f"136.{random.randint(0, 9)}", f"138.{random.randint(0, 9)}"]
-    
-    selected_windows = random.choice(windows_versions)
-    selected_firefox = random.choice(firefox_versions)
-    
-    return {
-        "Host": "irs.thsrc.com.tw",
-        "User-Agent": f"Mozilla/5.0 (Windows NT {selected_windows}; Win64; x64; rv:{selected_firefox}) Gecko/20100101 Firefox/{selected_firefox}",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "zh-TW,zh;q=0.8,en-US;q=0.5,en;q=0.3",
-        "Accept-Encoding": "deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Referer": "https://irs.thsrc.com.tw/IMINT/",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-Mode": "no-cors",
-        # Add session-like headers to make each request appear unique
-        "X-Requested-With": "XMLHttpRequest",
-        "X-Session-ID": session_id,
-        "X-Device-ID": device_id,
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
 
 
 def _get_input(prompt: str, default, choices: Optional[List] = None) -> any:
@@ -224,39 +192,23 @@ def run(args) -> None:
     """Main booking flow with modern interface."""
     _print_header("THSR-Sniper")
     
-    session = requests.Session()
-    session.headers.update(_headers())
-    session.max_redirects = 20
+    session = create_booking_session()
 
     # First page
     _print_section("Step 1: Initializing Booking Session")
     print("Connecting to THSR booking system...")
     
-    try:
-        r = session.get(BOOKING_PAGE_URL, timeout=60)
-        r.raise_for_status()
-        print("✓ Connected successfully")
-    except Exception as e:
-        print(f"✗ Connection failed: {e}")
+    handshake = establish_booking_session(session)
+    if not handshake.ok:
+        print(f"✗ Connection failed: {handshake.error}")
         return
 
-    # Parse JSESSIONID
-    jsession = None
-    for c in session.cookies:
-        if c.name == "JSESSIONID":
-            jsession = c.value
-            break
-    if not jsession:
-        # Fallback try from response cookies
-        for c in r.cookies:
-            if c.name == "JSESSIONID":
-                jsession = c.value
-                break
-    if not jsession:
-        print("✗ Error: Cannot establish session")
-        return
-
-    print("✓ Session established")
+    r = handshake.response
+    jsession = handshake.jsession_id
+    print(
+        f"✓ Session established with {handshake.browser_impersonate} "
+        f"after {handshake.attempts} request(s)"
+    )
 
     soup = BeautifulSoup(r.text, "html.parser")
 
