@@ -26,6 +26,7 @@ from .schema import (
     normalize_preferred_train_numbers,
 )
 from .flows import run as run_booking_flow
+from .booking_session import probe_booking_session
 
 # Utility function to clean ANSI color codes
 def clean_ansi_codes(text: Optional[str]) -> Optional[str]:
@@ -699,88 +700,52 @@ def _booking_task_to_result(task: BookingTask) -> Dict[str, object]:
 
 @app.get("/health/thsr")
 async def test_thsr_connectivity():
-    """Test connectivity to THSR official website with caching and async optimization."""
+    """Test the GET-only THSR booking handshake used by real attempts."""
     import time
     import asyncio
-    import aiohttp
-    import random
-    from .flows import _headers
-    
+
     # Check cache first
     current_time = time.time()
     if (_thsr_connectivity_cache["status"] is not None and 
         current_time - _thsr_connectivity_cache["last_checked"] < _thsr_connectivity_cache["cache_duration"]):
         return _thsr_connectivity_cache["status"]
-    
+
     try:
-        # Generate random session-like parameters to simulate different users/devices
-        session_params = {
-            'user_agent_suffix': f"_{random.randint(1000, 9999)}",
-            'timestamp': str(int(current_time)),
-            'random_id': random.randint(100000, 999999)
+        handshake = await asyncio.to_thread(probe_booking_session)
+        response_time_ms = round(handshake.elapsed_seconds * 1000, 2)
+        if handshake.ok:
+            status = "online"
+            message = "高鐵訂票頁與訂票 Session 連線正常"
+        elif handshake.classification in {
+            "rate-limited",
+            "queue",
+            "maintenance-or-overloaded",
+        }:
+            status = "degraded"
+            message = f"高鐵訂票服務目前受限：{handshake.classification}"
+        elif handshake.classification == "connection-error":
+            status = "offline"
+            message = "無法建立高鐵訂票連線"
+        else:
+            status = "error"
+            message = f"無法建立高鐵訂票 Session：{handshake.classification}"
+
+        result = {
+            "status": status,
+            "response_time_ms": response_time_ms,
+            "message": message,
+            "tested_at": current_time,
+            "browser_impersonate": handshake.browser_impersonate,
+            "response_type": handshake.classification,
+            "attempts": handshake.attempts,
         }
-        
-        headers = _headers()
-        headers['User-Agent'] += session_params['user_agent_suffix']
-        headers['X-Requested-With'] = 'XMLHttpRequest'
-        headers['X-Session-ID'] = f"session_{session_params['random_id']}_{session_params['timestamp']}"
-        
-        # Use async HTTP client with shorter timeout and HEAD request for faster response
-        start_time = time.time()
-        
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-            # First try HEAD request for faster response
-            try:
-                async with session.head(
-                    "https://irs.thsrc.com.tw/IMINT/?locale=tw",
-                    headers=headers,
-                    allow_redirects=True
-                ) as response:
-                    response_time = round((time.time() - start_time) * 1000, 2)
-                    
-                    if response.status == 200:
-                        result = {
-                            "status": "online",
-                            "response_time_ms": response_time,
-                            "message": "高鐵官網連線正常",
-                            "tested_at": current_time,
-                            "session_info": f"Session ID: {session_params['random_id']}"
-                        }
-                    else:
-                        result = {
-                            "status": "error",
-                            "response_time_ms": response_time,
-                            "message": f"高鐵官網連線失敗 (HTTP {response.status})",
-                            "tested_at": current_time
-                        }
-            except asyncio.TimeoutError:
-                result = {
-                    "status": "timeout",
-                    "response_time_ms": None,
-                    "message": "高鐵官網連線逾時",
-                    "tested_at": current_time
-                }
-            except aiohttp.ClientConnectorError:
-                result = {
-                    "status": "offline",
-                    "response_time_ms": None,
-                    "message": "無法連線至高鐵官網，請檢查網路連線",
-                    "tested_at": current_time
-                }
-            except Exception as e:
-                result = {
-                    "status": "error",
-                    "response_time_ms": None,
-                    "message": f"高鐵官網連線測試發生錯誤: {str(e)}",
-                    "tested_at": current_time
-                }
-        
+
         # Update cache
         _thsr_connectivity_cache["status"] = result
         _thsr_connectivity_cache["last_checked"] = current_time
-        
+
         return result
-            
+
     except HTTPException:
         raise
     except Exception as e:
