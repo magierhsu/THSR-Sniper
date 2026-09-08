@@ -76,6 +76,16 @@ def request():
 
 
 class BookingPreferenceModelTests(unittest.TestCase):
+    def test_opening_settings_roundtrip_and_validation(self):
+        model = BookingPreferences(**preference_payload(opening_mode=True,
+            sales_open_at='2030-09-02T00:00:00+08:00', burst_minutes=5, burst_retry_seconds=3))
+        stored = read_booking_preferences(merge_booking_preferences('{"theme":"dark"}', model))
+        self.assertEqual('2030-09-01T16:00:00+00:00', stored['sales_open_at'])
+        self.assertEqual(5, stored['burst_minutes'])
+        for values in ({'burst_minutes':6}, {'burst_retry_seconds':2}, {'sales_open_at':'broken'}):
+            with self.assertRaises(ValidationError):
+                BookingPreferences(**preference_payload(**values))
+
     def test_normalizes_preferred_train_numbers(self):
         preferences = BookingPreferences(**preference_payload())
         self.assertEqual(["825", "838"], preferences.preferred_train_numbers)

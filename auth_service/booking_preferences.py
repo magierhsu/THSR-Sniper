@@ -15,6 +15,21 @@ class BookingPreferences(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     version: Literal[1] = 1
+    opening_mode: bool = False
+    sales_open_at: Optional[str] = None
+    burst_minutes: int = Field(default=2, ge=1, le=5)
+    burst_retry_seconds: int = Field(default=5, ge=3, le=10)
+
+    @field_validator('sales_open_at')
+    @classmethod
+    def validate_opening_time(cls, value):
+        if value is not None:
+            from datetime import timezone
+            parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            if parsed.tzinfo is None:
+                raise ValueError('sales_open_at must include timezone')
+            return parsed.astimezone(timezone.utc).isoformat()
+        return value
     from_station: int = Field(ge=1, le=12)
     to_station: int = Field(ge=1, le=12)
     date: str
