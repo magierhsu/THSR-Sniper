@@ -246,7 +246,15 @@ Examples:
         help="Disable automatic captcha OCR recognition, use manual input only"
     )
 
+    parser.add_argument('--opening-mode', action='store_true', help='Enable opening-time burst scheduling')
+    parser.add_argument('--sales-open-at', help='Opening timestamp with timezone, e.g. 2026-10-01T00:00:00+08:00')
+    parser.add_argument('--burst-minutes', type=int, default=2, choices=range(1, 6))
+    parser.add_argument('--burst-retry-seconds', type=int, default=5, choices=range(3, 11))
     args = parser.parse_args()
+    if args.opening_mode and not args.schedule:
+        parser.error('--opening-mode requires --schedule')
+    if args.opening_mode and not args.sales_open_at:
+        parser.error('--opening-mode requires --sales-open-at with timezone')
 
     # Process date input for modern CLI format
     if args.date:

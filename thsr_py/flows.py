@@ -9,6 +9,7 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests
+from .worker_protocol import WorkerResult, check_cooldown, confirmation_permission, cooldown_until
 
 from .booking_session import (
     BASE_URL,
@@ -189,10 +190,24 @@ def show_time_table() -> None:
 
 
 def run(args) -> None:
+    result = WorkerResult()
+    args._booking_result = result
+    session = create_booking_session()
+    try:
+        _run_with_session(args, session)
+    except Exception as exc:
+        result.error = type(exc).__name__
+        raise
+    finally:
+        result.retry_at = cooldown_until()
+        session.close()
+
+
+def _run_with_session(args, session) -> None:
     """Main booking flow with modern interface."""
     _print_header("THSR-Sniper")
     
-    session = create_booking_session()
+    result = args._booking_result
 
     # First page
     _print_section("Step 1: Initializing Booking Session")
@@ -200,6 +215,7 @@ def run(args) -> None:
     
     handshake = establish_booking_session(session)
     if not handshake.ok:
+        result.error = handshake.error
         print(f"✗ Connection failed: {handshake.error}")
         return
 
@@ -213,6 +229,7 @@ def run(args) -> None:
     soup = BeautifulSoup(r.text, "html.parser")
 
     # Security code image
+    result.stage = 'captcha'
     _print_section("Step 2: Security Verification")
     img_src = soup.select_one("#BookingS1Form_homeCaptcha_passCode").get("src")
     img_url = f"{BASE_URL}{img_src}"
@@ -278,6 +295,7 @@ def run(args) -> None:
     payload.input_security_code(img_r.content, not getattr(args, "no_ocr", False))
 
     # Submit booking request
+    result.stage = 'query'
     _print_section("Step 4: Submitting Booking Request")
     print("Sending booking request...")
     
@@ -301,6 +319,7 @@ def run(args) -> None:
         return
 
     # Second page
+    result.stage = 'train-selection'
     _print_section("Step 5: Train Selection")
     train_index = getattr(args, "train_index", None)
     preferred_train_numbers = getattr(args, "preferred_train_numbers", [])
@@ -318,6 +337,7 @@ def run(args) -> None:
         return
 
     # Final page
+    result.stage = 'confirmation'
     _print_section("Step 6: Final Confirmation")
     soup = _confirm_ticket_flow(session, soup, args)
     if soup is None:
@@ -675,6 +695,10 @@ def _confirm_ticket_flow(session: requests.Session, soup: BeautifulSoup, args) -
         form_data.update(additional_payload)
 
     print("Processing final confirmation...")
+    check_cooldown()
+    confirmation_permission()
+    result = getattr(args, '_booking_result', WorkerResult())
+    result.uncertain = True
     r = session.post(
         CONFIRM_TICKET_URL,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -683,8 +707,15 @@ def _confirm_ticket_flow(session: requests.Session, soup: BeautifulSoup, args) -
     )
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
+    pnr = soup.select_one('p.pnr-code span')
+    if pnr and pnr.get_text(strip=True):
+        result.pnr = pnr.get_text(strip=True)
+        result.uncertain = False
+        return soup
     err = _parse_error(soup)
     if err:
+        result.uncertain = False
+        result.error = err
         print(f"✗ Error: {err}")
         return None
     return soup

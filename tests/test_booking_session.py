@@ -70,7 +70,7 @@ class BookingSessionTests(unittest.TestCase):
         self.assertEqual("chrome", resolve_browser_impersonate(" chrome "))
         self.assertEqual(DEFAULT_BROWSER_IMPERSONATE, resolve_browser_impersonate("safari"))
 
-    @patch("thsr_py.booking_session.requests.Session")
+    @patch("thsr_py.booking_session.BookingSession")
     def test_create_session_passes_impersonation_to_curl_cffi(self, session_factory):
         session = MagicMock()
         session.headers = {}
@@ -101,7 +101,7 @@ class BookingSessionTests(unittest.TestCase):
 
     def test_retry_after_supports_seconds_and_http_dates(self):
         seconds_response = FakeResponse(headers={"Retry-After": "45"})
-        self.assertEqual(30.0, retry_after_seconds(seconds_response))
+        self.assertEqual(45.0, retry_after_seconds(seconds_response))
 
         now_epoch = 1_800_000_000.0
         retry_at = datetime.fromtimestamp(now_epoch + 12, tz=timezone.utc)

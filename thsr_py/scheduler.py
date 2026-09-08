@@ -4,7 +4,8 @@ import io
 import multiprocessing
 import time
 import uuid
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,8 @@ import fcntl
 import os
 
 from .flows import run as run_booking_flow
+from .opening import OPENING_FIELDS, utc, validate_opening
+from .worker_protocol import WorkerResult, configure, cooldown_until
 from .schema import (
     MAX_DEPARTURE_TIME_RANGE_MINUTES,
     MAX_PREFERRED_TRAIN_NUMBERS,
@@ -43,12 +46,42 @@ def _booking_worker_ready() -> int:
     return os.getpid()
 
 
-def _run_booking_flow_worker(args) -> tuple[str, str, Optional[str]]:
+def _initialize_worker(cooldown, ready):
+    os.environ.setdefault('TF_NUM_INTRAOP_THREADS', '1')
+    os.environ.setdefault('TF_NUM_INTEROP_THREADS', '1')
+    os.environ.setdefault('OMP_NUM_THREADS', '1')
+    configure(cooldown)
+    started = time.monotonic()
+    error = None
+    try:
+        from .flows import _get_ocr_model
+        from PIL import Image
+        import tempfile
+        model = _get_ocr_model()
+        if model is None:
+            raise RuntimeError('OCR 模型載入失敗')
+        with tempfile.NamedTemporaryFile(suffix='.png') as image:
+            Image.new('RGB', (160, 50), 'white').save(image.name)
+            model.predict_image(image.name)
+    except Exception as exc:
+        error = str(exc)
+    import resource
+    ready.put({'pid': os.getpid(), 'seconds': time.monotonic() - started,
+               'cpu_seconds': time.process_time(),
+               'rss_kb': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+               'error': error})
+
+
+def _run_booking_flow_worker(args) -> WorkerResult | tuple[str, str, Optional[str]]:
     """Run one booking flow in an isolated process."""
     stdout_buffer = io.StringIO()
     stderr_buffer = io.StringIO()
     original_non_interactive = os.environ.get("THSR_NON_INTERACTIVE")
     error = None
+    control = getattr(args, '_control', None)
+    if control is not None:
+        from . import worker_protocol
+        worker_protocol._control = control
 
     try:
         os.environ["THSR_NON_INTERACTIVE"] = "1"
@@ -62,7 +95,12 @@ def _run_booking_flow_worker(args) -> tuple[str, str, Optional[str]]:
         else:
             os.environ["THSR_NON_INTERACTIVE"] = original_non_interactive
 
-    return stdout_buffer.getvalue(), stderr_buffer.getvalue(), error
+    result = getattr(args, '_booking_result', None)
+    if result is None:  # Legacy embedding/tests.
+        return stdout_buffer.getvalue(), stderr_buffer.getvalue(), error
+    result.error = result.error or error or '訂票未成功，未找到符合條件的班次或驗證未通過'
+    result.retry_at = cooldown_until()
+    return result
 
 
 class BookingStatus(Enum):
@@ -115,6 +153,37 @@ class BookingTask:
     # Scheduler settings
     interval_minutes: int = 5
     max_attempts: Optional[int] = None  # None means unlimited until expired
+    opening_mode: bool = False
+    sales_open_at: Optional[datetime] = None
+    burst_minutes: int = 2
+    burst_retry_seconds: int = 5
+    last_finished: Optional[datetime] = None
+    retry_not_before: Optional[datetime] = None
+    confirmation_pending: bool = False
+    needs_confirmation: bool = False
+
+    def sales_open(self, now):
+        if self.opening_mode:
+            return self.sales_open_at is not None and now >= self.sales_open_at
+        return is_ticket_sales_open(self.date)
+
+    def in_burst(self, now):
+        return bool(self.opening_mode and self.sales_open_at and
+                    self.sales_open_at <= now < self.sales_open_at + timedelta(minutes=self.burst_minutes))
+
+    def due_at(self, now):
+        if self.last_attempt is None:
+            due = self.sales_open_at if self.opening_mode else self.created_at
+        elif self.in_burst(now):
+            due = (self.last_finished or self.last_attempt) + timedelta(seconds=self.burst_retry_seconds)
+        else:
+            due = self.last_attempt + timedelta(minutes=self.interval_minutes)
+        due = due or now
+        if self.opening_mode and self.sales_open_at:
+            due = max(due, self.sales_open_at)
+        if self.retry_not_before:
+            due = max(due, self.retry_not_before)
+        return due
     
     # Status tracking
     status: BookingStatus = BookingStatus.PENDING
@@ -194,7 +263,14 @@ class BookingTask:
             "last_attempt": self.last_attempt.isoformat().replace('+00:00', 'Z') if self.last_attempt else None,
             "attempts": self.attempts,
             "success_pnr": self.success_pnr,
-            "error_message": self.error_message
+            "error_message": self.error_message,
+            "opening_mode": self.opening_mode,
+            "burst_minutes": self.burst_minutes,
+            "burst_retry_seconds": self.burst_retry_seconds,
+            "confirmation_pending": self.confirmation_pending,
+            "needs_confirmation": self.needs_confirmation,
+            **{key: getattr(self, key).isoformat() if getattr(self, key) else None
+               for key in ('sales_open_at', 'last_finished', 'retry_not_before')},
         }
     
     @classmethod
@@ -249,6 +325,11 @@ class BookingTask:
                 last_attempt_str += '+00:00'
             task.last_attempt = datetime.fromisoformat(last_attempt_str)
             
+        for key in ('opening_mode', 'burst_minutes', 'burst_retry_seconds', 'confirmation_pending', 'needs_confirmation'):
+            if key in data:
+                setattr(task, key, data[key])
+        for key in ('sales_open_at', 'last_finished', 'retry_not_before'):
+            setattr(task, key, utc(data.get(key)))
         return task
 
 
@@ -275,7 +356,7 @@ class BookingScheduler:
         self.running = False
         self.scheduler_thread: Optional[threading.Thread] = None
         self.max_concurrent_bookings = _bounded_env_int(
-            "THSR_MAX_CONCURRENT_BOOKINGS", 2, 1, 4
+            "THSR_MAX_CONCURRENT_BOOKINGS", 2, 1, 2
         )
         self.poll_interval_seconds = _bounded_env_int(
             "THSR_SCHEDULER_POLL_SECONDS", 1, 1, 30
@@ -284,6 +365,14 @@ class BookingScheduler:
         self._stop_event = threading.Event()
         self._state_lock = threading.RLock()
         self._executor_lock_handle = None
+        self._inflight = {}
+        self._controls = {}
+        self._warmup_reports = []
+        self._persisted_cooldown = 0.0
+        self._pool_broken = False
+        self._pool_retry_at = 0.0
+        self._cooldown = multiprocessing.get_context('spawn').Value('d', 0.0)
+        configure(self._cooldown)
         self.logger = self._setup_logger()
         
         # Initialize file modification time tracking
@@ -299,7 +388,12 @@ class BookingScheduler:
         changed = False
         with self._state_lock:
             for task in self.tasks.values():
-                if task.status == BookingStatus.RUNNING:
+                if task.confirmation_pending or task.needs_confirmation:
+                    task.needs_confirmation = True
+                    task.status = BookingStatus.PAUSED
+                    task.error_message = '訂票結果待確認，請先向高鐵確認是否成立訂位'
+                    changed = True
+                elif task.status == BookingStatus.RUNNING:
                     task.status = BookingStatus.PENDING
                     changed = True
                 elif task.status == BookingStatus.PAUSING:
@@ -382,6 +476,7 @@ class BookingScheduler:
                         return
                     
                     data = json.loads(content)
+                    self._cooldown.value = max(self._cooldown.value, data.get('cooldown_until', 0.0))
                     for task_data in data.get("tasks", []):
                         task = BookingTask.from_dict(task_data)
                         self.tasks[task.id] = task
@@ -452,10 +547,10 @@ class BookingScheduler:
         with self._state_lock:
             self._save_tasks_locked()
 
-    def _save_tasks_locked(self) -> None:
+    def _save_tasks_locked(self) -> bool:
         """Save tasks to storage file with simplified locking."""
         if not self.enable_persistence or not self.storage_path:
-            return
+            return True
             
         try:
             # Ensure parent directory exists
@@ -463,6 +558,7 @@ class BookingScheduler:
             
             data = {
                 "tasks": [task.to_dict() for task in self.tasks.values()],
+                "cooldown_until": self._cooldown.value,
                 "last_updated": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
             }
             
@@ -478,14 +574,21 @@ class BookingScheduler:
                 lock_acquired = True
             except FileExistsError:
                 self.logger.debug("File is locked by another process, skipping save")
-                return
+                return False
             
             try:
                 with open(temp_path, 'w') as f:
                     json.dump(data, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
                 
                 # Atomic move
                 temp_path.replace(self.storage_path)
+                directory_fd = os.open(self.storage_path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
                 
                 # Update our tracked modification time
                 if self.storage_path.exists():
@@ -506,6 +609,8 @@ class BookingScheduler:
             self.logger.error(f"Failed to save tasks to storage: {e}")
             import traceback
             self.logger.debug(f"Save error traceback: {traceback.format_exc()}")
+            return False
+        return True
     
     def add_task(self, task: BookingTask) -> str:
         """Add a new booking task."""
@@ -582,6 +687,8 @@ class BookingScheduler:
                 raise TaskNotFoundError(task_id)
             if user_id is not None and task.user_id != user_id:
                 raise TaskOwnershipError(task_id)
+            if task.needs_confirmation or task.confirmation_pending:
+                raise TaskStateError("請先確認是否已訂位成功")
             if task.status != BookingStatus.PAUSED:
                 raise TaskStateError("Only paused tasks can be resumed")
             if task.max_attempts and task.attempts >= task.max_attempts:
@@ -591,7 +698,7 @@ class BookingScheduler:
 
             task.status = (
                 BookingStatus.PENDING
-                if is_ticket_sales_open(task.date)
+                if task.sales_open(datetime.now(timezone.utc))
                 else BookingStatus.WAITING
             )
             task.last_attempt = None
@@ -633,16 +740,20 @@ class BookingScheduler:
                 raise TaskNotFoundError(task_id)
             if user_id is not None and task.user_id != user_id:
                 raise TaskOwnershipError(task_id)
+            if task.needs_confirmation or task.confirmation_pending:
+                raise TaskStateError("請先確認是否已訂位成功")
             if task.status != BookingStatus.PAUSED:
                 raise TaskStateError("Only paused tasks can be edited")
 
-            for field_name in editable_fields:
+            for field_name in (*editable_fields, *OPENING_FIELDS):
                 value = getattr(replacement, field_name)
                 if field_name == "preferred_train_numbers":
                     value = list(value)
                 setattr(task, field_name, value)
 
             task.attempts = 0
+            task.last_finished = None
+            task.retry_not_before = None
             task.last_attempt = None
             task.success_pnr = None
             task.error_message = None
@@ -689,16 +800,23 @@ class BookingScheduler:
 
         try:
             worker_context = multiprocessing.get_context("spawn")
+            self._ready_queue = worker_context.Queue()
             self._booking_executor = ProcessPoolExecutor(
                 max_workers=self.max_concurrent_bookings,
                 mp_context=worker_context,
+                initializer=_initialize_worker,
+                initargs=(self._cooldown, self._ready_queue),
             )
             warmup_futures = [
                 self._booking_executor.submit(_booking_worker_ready)
                 for _ in range(self.max_concurrent_bookings)
             ]
+            for _ in warmup_futures:
+                report = self._ready_queue.get(timeout=90)
+                self._warmup_reports.append(report)
+                self.logger.info("OCR worker warmup: %s", report)
             for future in warmup_futures:
-                future.result(timeout=30)
+                future.result(timeout=90)
         except Exception as exc:
             self.logger.error(f"Failed to initialize booking workers: {exc}")
             if self._booking_executor is not None:
@@ -736,7 +854,7 @@ class BookingScheduler:
             while self.running:
                 try:
                     self._process_tasks()
-                    if self._stop_event.wait(self.poll_interval_seconds):
+                    if self._stop_event.wait(0.1):
                         break
                 except Exception as e:
                     self.logger.error(f"Error in scheduler loop: {e}")
@@ -744,77 +862,83 @@ class BookingScheduler:
                         break
         finally:
             self.running = False
+            while self._inflight:
+                self._collect_workers()
+                time.sleep(0.1)
             if self._booking_executor is not None:
                 self._booking_executor.shutdown(wait=True, cancel_futures=False)
                 self._booking_executor = None
             self._release_executor_lock()
     
     def _process_tasks(self) -> None:
-        """Process all pending tasks."""
-        current_time = datetime.now(timezone.utc)
-        due_tasks = []
-        state_changed = False
-
+        """Collect each completed worker, then dispatch fairly into free slots."""
+        self._collect_workers()
+        if self._pool_broken:
+            if self._inflight or time.monotonic() < self._pool_retry_at:
+                return
+            try:
+                self._booking_executor.shutdown(wait=False, cancel_futures=True)
+                context = multiprocessing.get_context('spawn')
+                self._ready_queue = context.Queue()
+                self._booking_executor = ProcessPoolExecutor(
+                    max_workers=self.max_concurrent_bookings, mp_context=context,
+                    initializer=_initialize_worker, initargs=(self._cooldown, self._ready_queue))
+                ready = [self._booking_executor.submit(_booking_worker_ready)
+                         for _ in range(self.max_concurrent_bookings)]
+                reports = [self._ready_queue.get(timeout=90) for _ in ready]
+                for future in ready:
+                    future.result(timeout=90)
+                with self._state_lock:
+                    self._warmup_reports = reports
+                    self._pool_broken = False
+                self.logger.info('Booking workers recovered after process failure')
+            except Exception:
+                self._pool_retry_at = time.monotonic() + 5
+                self.logger.exception('Unable to recover booking workers')
+                return
         with self._state_lock:
-            for task in list(self.tasks.values()):
-                if task.status in [
-                    BookingStatus.SUCCESS,
-                    BookingStatus.CANCELLED,
-                    BookingStatus.DELETED,
-                    BookingStatus.PAUSED,
-                    BookingStatus.PAUSING,
-                    BookingStatus.RUNNING,
-                ]:
+            now = datetime.now(timezone.utc)
+            if self._cooldown.value != self._persisted_cooldown:
+                if self._save_tasks_locked():
+                    self._persisted_cooldown = self._cooldown.value
+            due, reservations = [], 0
+            changed = False
+            for task in self.tasks.values():
+                if task.status not in (BookingStatus.PENDING, BookingStatus.WAITING):
                     continue
-
-                if task.is_expired():
-                    task.status = BookingStatus.EXPIRED
-                    state_changed = True
-                    self.logger.info(f"Task {task.id} expired")
+                if task.needs_confirmation or task.confirmation_pending:
+                    task.status = BookingStatus.PAUSED
+                    changed = True
                     continue
-
-                if task.should_stop():
-                    task.status = BookingStatus.FAILED
-                    task.error_message = "Maximum attempts reached"
-                    state_changed = True
-                    self.logger.info(f"Task {task.id} stopped after {task.attempts} attempts")
+                if task.is_expired() or task.should_stop():
+                    task.status = BookingStatus.EXPIRED if task.is_expired() else BookingStatus.FAILED
+                    changed = True
                     continue
-
-                if not is_ticket_sales_open(task.date):
-                    if task.status != BookingStatus.WAITING:
-                        task.status = BookingStatus.WAITING
-                        state_changed = True
-                        self.logger.info(f"Task {task.id} waiting for ticket sales to open at 00:00 Taiwan time")
+                if task.opening_mode and task.sales_open_at and timedelta(0) < task.sales_open_at - now <= timedelta(seconds=30):
+                    reservations += 1
+                if not task.sales_open(now):
+                    changed |= task.status != BookingStatus.WAITING
+                    task.status = BookingStatus.WAITING
                     continue
-
-                if task.status == BookingStatus.WAITING:
-                    task.status = BookingStatus.PENDING
-                    state_changed = True
-                    self.logger.info(f"Task {task.id} ticket sales now open, resuming booking attempts")
-
-                if task.last_attempt is None:
-                    should_run = True
-                else:
-                    task_last_attempt = task.last_attempt
-                    if task_last_attempt.tzinfo is None:
-                        task_last_attempt = task_last_attempt.replace(tzinfo=timezone.utc)
-                    time_since_last = current_time - task_last_attempt
-                    should_run = time_since_last >= timedelta(minutes=task.interval_minutes)
-
-                if should_run:
-                    due_tasks.append(task)
-
-            if state_changed and not due_tasks:
+                changed |= task.status != BookingStatus.PENDING
+                task.status = BookingStatus.PENDING
+                if task.due_at(now) <= now:
+                    due.append(task)
+            due.sort(key=lambda t: (not t.in_burst(now), t.due_at(now), t.created_at, t.id))
+            if self._cooldown.value <= now.timestamp():
+                free = self.max_concurrent_bookings - len(self._inflight)
+                selected = []
+                for task in due:
+                    if len(selected) >= free:
+                        break
+                    if not task.in_burst(now) and free - len(selected) <= min(reservations, self.max_concurrent_bookings):
+                        continue
+                    selected.append(task)
+                self._execute_booking_tasks(selected, now)
+            if changed:
                 self._save_tasks_locked()
+            self._cleanup_deleted_tasks(now)
 
-        if due_tasks:
-            self._execute_booking_tasks(due_tasks, current_time)
-        
-        # Periodically clean up old deleted tasks (every hour)
-        self._cleanup_deleted_tasks(current_time)
-        
-        # Booking task state is saved before dispatch and after each worker result.
-    
     def _cleanup_deleted_tasks(self, current_time: datetime) -> None:
         """Clean up tasks that have been marked as deleted for more than 1 hour."""
         if not hasattr(self, '_last_cleanup_time'):
@@ -875,61 +999,137 @@ class BookingScheduler:
         
         self._save_tasks()
     
-    def _execute_booking_tasks(
-        self, tasks: List[BookingTask], attempt_time: datetime
-    ) -> None:
-        """Dispatch due tasks to the bounded isolated worker pool."""
+    def _execute_booking_tasks(self, tasks, attempt_time):
         if self._booking_executor is None:
-            self.logger.error("Booking worker pool is not available")
             return
-
-        future_to_task = {}
         with self._state_lock:
             for task in tasks:
-                if task.status != BookingStatus.PENDING:
+                if len(self._inflight) >= self.max_concurrent_bookings:
+                    break
+                if task.status != BookingStatus.PENDING or task.id in self._inflight:
                     continue
-
+                parent, child = multiprocessing.get_context('spawn').Pipe()
+                args = task.to_args_namespace()
+                args._control = child
+                previous_attempt = task.last_attempt
                 task.status = BookingStatus.RUNNING
                 task.last_attempt = attempt_time
                 task.attempts += 1
-                self.logger.info(f"Executing task {task.id} (attempt {task.attempts})")
-
                 try:
-                    future = self._booking_executor.submit(
-                        _run_booking_flow_worker, task.to_args_namespace()
-                    )
-                    future_to_task[future] = task
+                    if not self._save_tasks_locked():
+                        raise RuntimeError('無法保存任務，未派發訂票')
+                    future = self._booking_executor.submit(_run_booking_flow_worker, args)
+                    self.logger.info('Dispatch task %s attempt %s', task.id, task.attempts)
+                    self._inflight[task.id] = future
+                    self._controls[task.id] = (parent, child)
                 except Exception as exc:
+                    if isinstance(exc, BrokenProcessPool):
+                        self._pool_broken = True
+                    parent.close()
+                    child.close()
                     task.status = BookingStatus.PENDING
-                    task.error_message = f"Booking worker submission error: {exc}"[:500]
-                    self.logger.error(
-                        f"Task {task.id} could not be submitted to a worker: {exc}"
-                    )
+                    task.last_attempt = previous_attempt
+                    task.attempts -= 1
+                    task.error_message = str(exc)
+                    self._save_tasks_locked()
+            self._collect_workers()
 
-            self._save_tasks_locked()
-
-        for future in as_completed(future_to_task):
-            task = future_to_task[future]
-            try:
-                output, stderr_output, worker_error = future.result()
-            except Exception as exc:
-                output = ""
-                stderr_output = ""
-                worker_error = f"{type(exc).__name__}: {exc}"
-
-            with self._state_lock:
-                self._apply_booking_result(
-                    task, output, stderr_output, worker_error
-                )
-                self.logger.info(
-                    f"Task {task.id} FINAL SAVE - status={task.status.value}, "
-                    f"pnr={task.success_pnr}"
-                )
+    def _collect_workers(self):
+        with self._state_lock:
+            for task_id, future in list(self._inflight.items()):
+                task = self.tasks[task_id]
+                parent, child = self._controls[task_id]
+                if parent.poll():
+                    try:
+                        message = parent.recv()
+                        allowed = False
+                        if message == 'confirm' and task.status == BookingStatus.RUNNING and not task.needs_confirmation:
+                            task.confirmation_pending = True
+                            allowed = bool(self._save_tasks_locked())
+                            if not allowed:
+                                task.confirmation_pending = False
+                        parent.send('allowed' if allowed else 'denied')
+                    except (EOFError, OSError):
+                        pass
+                if not future.done():
+                    continue
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    if isinstance(exc, BrokenProcessPool):
+                        self._pool_broken = True
+                    result = WorkerResult(error=type(exc).__name__, uncertain=task.confirmation_pending)
+                if isinstance(result, WorkerResult):
+                    task.last_finished = datetime.now(timezone.utc)
+                    task.retry_not_before = datetime.fromtimestamp(result.retry_at, timezone.utc) if result.retry_at else None
+                    if result.pnr:
+                        task.success_pnr = result.pnr
+                        task.status = BookingStatus.SUCCESS
+                        task.error_message = None
+                        task.needs_confirmation = task.confirmation_pending = False
+                    elif result.uncertain:
+                        task.needs_confirmation = True
+                        task.confirmation_pending = True
+                        task.status = BookingStatus.PAUSED
+                        task.error_message = '訂票結果待確認，請先向高鐵確認是否成立訂位'
+                    else:
+                        task.confirmation_pending = False
+                        task.error_message = result.error
+                        if task.status not in (BookingStatus.CANCELLED, BookingStatus.DELETED):
+                            task.status = BookingStatus.PAUSED if task.status == BookingStatus.PAUSING else BookingStatus.PENDING
+                else:
+                    self._apply_booking_result(task, *result)
+                    task.last_finished = datetime.now(timezone.utc)
                 self._save_tasks_locked()
-            self.logger.info(
-                f"Task {task.id} SAVE COMPLETED - status={task.status.value}, "
-                f"attempts={task.attempts}"
-            )
+                self.logger.info('Task %s completed attempt %s: %s', task.id, task.attempts, task.status.value)
+                parent.close()
+                child.close()
+                del self._inflight[task_id]
+                del self._controls[task_id]
+
+    def resolve_confirmation(self, task_id, user_id, pnr=None):
+        with self._state_lock:
+            task = self.tasks.get(task_id)
+            if task is None:
+                raise TaskNotFoundError(task_id)
+            if user_id is not None and task.user_id != user_id:
+                raise TaskOwnershipError(task_id)
+            if not task.needs_confirmation or task_id in self._inflight:
+                raise TaskStateError('此任務沒有待確認的訂位結果')
+            task.needs_confirmation = task.confirmation_pending = False
+            task.error_message = None
+            if pnr:
+                task.success_pnr = pnr
+                task.status = BookingStatus.SUCCESS
+            elif task.should_stop():
+                task.status = BookingStatus.FAILED
+                task.error_message = '已達嘗試上限或任務已過期，請修改後再繼續'
+            else:
+                task.status = BookingStatus.PENDING if task.sales_open(datetime.now(timezone.utc)) else BookingStatus.WAITING
+                task.last_attempt = None
+            if not self._save_tasks_locked():
+                task.needs_confirmation = task.confirmation_pending = True
+                task.status = BookingStatus.PAUSED
+                raise TaskStateError('儲存失敗，仍維持結果待確認')
+            return task
+
+    def execution_info(self, task):
+        with self._state_lock:
+            now = datetime.now(timezone.utc)
+            due = max(task.due_at(now), datetime.fromtimestamp(self._cooldown.value, timezone.utc))
+            phase = task.status.value
+            if task.needs_confirmation:
+                phase = 'needs_confirmation'
+            elif task.status in (BookingStatus.PENDING, BookingStatus.WAITING):
+                phase = 'waiting_opening' if not task.sales_open(now) else ('waiting_resource' if due <= now else 'waiting_retry')
+            return {
+                'execution_phase': phase,
+                'in_burst': task.in_burst(now) and task.status in (BookingStatus.PENDING, BookingStatus.RUNNING),
+                'next_attempt_at': due.isoformat() if task.status in (BookingStatus.PENDING, BookingStatus.WAITING) else None,
+                'concurrency_limit': self.max_concurrent_bookings,
+                'same_opening_tasks': sum(1 for t in self.tasks.values() if t.user_id == task.user_id and t.opening_mode and t.sales_open_at == task.sales_open_at and t.status in (BookingStatus.PENDING, BookingStatus.WAITING, BookingStatus.RUNNING)),
+                'warmup_warning': any(r['error'] for r in self._warmup_reports),
+            }
 
     def _apply_booking_result(
         self,
@@ -1135,6 +1335,10 @@ def create_booking_task(
     if len(personal_id) != 10:
         raise ValueError("Personal ID must be 10 characters long")
     
+    if 'opening_mode' in kwargs or 'sales_open_at' in kwargs:
+        kwargs['sales_open_at'] = validate_opening(
+            kwargs.get('opening_mode', False), kwargs.get('sales_open_at'),
+            kwargs.get('burst_minutes', 2), kwargs.get('burst_retry_seconds', 5), date)
     task = BookingTask(
         id=str(uuid.uuid4()),
         from_station=from_station,

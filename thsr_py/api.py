@@ -25,8 +25,8 @@ from .schema import (
     TIME_TABLE,
     normalize_preferred_train_numbers,
 )
-from .flows import run as run_booking_flow
 from .booking_session import probe_booking_session
+from .opening import OPENING_FIELDS, validate_opening
 
 # Utility function to clean ANSI color codes
 def clean_ansi_codes(text: Optional[str]) -> Optional[str]:
@@ -155,6 +155,17 @@ class BookingRequest(BaseModel):
 
 
 class ScheduledBookingRequest(BookingRequest):
+    opening_mode: bool = False
+    sales_open_at: Optional[datetime] = None
+    burst_minutes: int = Field(2, ge=1, le=5)
+    burst_retry_seconds: int = Field(5, ge=3, le=10)
+
+    @model_validator(mode="after")
+    def check_opening(self):
+        self.sales_open_at = validate_opening(self.opening_mode, self.sales_open_at,
+            self.burst_minutes, self.burst_retry_seconds, self.date)
+        return self
+
     interval_minutes: int = Field(5, ge=1, description="Booking attempt interval in minutes")
     max_attempts: Optional[int] = Field(None, ge=1, description="Maximum number of attempts (unlimited if null)")
 
@@ -171,6 +182,18 @@ class BookingResponse(BaseModel):
 
 
 class TaskStatusResponse(BaseModel):
+    opening_mode: bool = False
+    sales_open_at: Optional[str] = None
+    burst_minutes: int = 2
+    burst_retry_seconds: int = 5
+    needs_confirmation: bool = False
+    execution_phase: str = ''
+    in_burst: bool = False
+    next_attempt_at: Optional[str] = None
+    concurrency_limit: int = 2
+    same_opening_tasks: int = 0
+    warmup_warning: bool = False
+
     id: str
     status: str
     from_station: int
@@ -199,6 +222,8 @@ class TaskStatusResponse(BaseModel):
 
 def _task_to_status_response(task: BookingTask) -> TaskStatusResponse:
     return TaskStatusResponse(
+        **get_scheduler().execution_info(task),
+        **{key: task.to_dict()[key] for key in (*OPENING_FIELDS, "needs_confirmation")},
         id=task.id,
         status=task.status.value,
         from_station=task.from_station,
@@ -311,89 +336,22 @@ async def get_time_slots():
 
 
 @app.post("/book", response_model=BookingResponse)
-async def immediate_booking(request: BookingRequest):
-    """Execute immediate booking (single attempt)."""
-    try:
-        # Convert request to args namespace
-        from argparse import Namespace
-        args = Namespace(
-            from_=request.from_station,
-            to=request.to_station,
-            date=request.date,
-            personal_id=request.personal_id,
-            use_membership=request.use_membership,
-            adult_cnt=request.adult_cnt if request.adult_cnt is not None else 0,
-            student_cnt=request.student_cnt if request.student_cnt is not None else 0,
-            child_cnt=request.child_cnt if request.child_cnt is not None else 0,
-            senior_cnt=request.senior_cnt if request.senior_cnt is not None else 0,
-            disabled_cnt=request.disabled_cnt if request.disabled_cnt is not None else 0,
-            time=request.time,
-            time_range_minutes=request.time_range_minutes,
-            train_index=request.train_index,
-            preferred_train_numbers=request.preferred_train_numbers,
-            seat_prefer=request.seat_prefer,
-            class_type=request.class_type,
-            no_ocr=request.no_ocr,
-            stations=False,
-            times=False
-        )
-        
-        # Execute booking flow
-        import io
-        import sys
-        import os
-        from contextlib import redirect_stdout, redirect_stderr
-        
-        # Set environment variable to indicate API mode (non-interactive)
-        original_api_mode = os.environ.get('THSR_API_MODE')
-        os.environ['THSR_API_MODE'] = '1'
-        
-        stdout_buffer = io.StringIO()
-        stderr_buffer = io.StringIO()
-        
-        try:
-            with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
-                run_booking_flow(args)
-            
-            output = stdout_buffer.getvalue()
-            
-            if "PNR Code:" in output:
-                # Extract PNR code
-                lines = output.split('\n')
-                pnr_code = None
-                for line in lines:
-                    if "PNR Code:" in line:
-                        pnr_code = line.split("PNR Code:")[-1].strip()
-                        break
-                
-                return BookingResponse(
-                    success=True,
-                    message="Booking completed successfully!",
-                    pnr_code=pnr_code
-                )
-            else:
-                error_output = stderr_buffer.getvalue()
-                error_msg = error_output if error_output else "Booking failed - no PNR code found"
-                
-                return BookingResponse(
-                    success=False,
-                    message=f"Booking failed: {error_msg}"
-                )
-        
-        except Exception as e:
-            return BookingResponse(
-                success=False,
-                message=f"Booking execution failed: {str(e)}"
-            )
-        finally:
-            # Restore original environment variable
-            if original_api_mode is None:
-                os.environ.pop('THSR_API_MODE', None)
-            else:
-                os.environ['THSR_API_MODE'] = original_api_mode
-    
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid request: {str(e)}")
+async def immediate_booking(request: BookingRequest,
+                            current_user_id: Optional[str] = Depends(get_current_user)):
+    """Execute one attempt through the same bounded, durable scheduler."""
+    import asyncio
+    if not current_user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    task = create_booking_task(**request.model_dump(),
+        user_id="cli-user" if current_user_id == "cli-internal" else current_user_id,
+        max_attempts=1)
+    scheduler = get_scheduler()
+    scheduler.add_task(task)
+    while task.status in (BookingStatus.PENDING, BookingStatus.WAITING, BookingStatus.RUNNING, BookingStatus.PAUSING):
+        await asyncio.sleep(0.2)
+    return BookingResponse(success=task.status == BookingStatus.SUCCESS,
+        message=task.error_message or "Booking completed",
+        pnr_code=task.success_pnr, task_id=task.id)
 
 
 @app.post("/schedule", response_model=BookingResponse)
@@ -402,6 +360,8 @@ async def schedule_booking(
     current_user_id: Optional[str] = Depends(get_current_user)
 ):
     """Schedule a booking task for periodic execution."""
+    if not current_user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
     try:
         # Determine user_id for task association
         # CLI internal access gets a special user_id, regular users get their actual user_id
@@ -420,6 +380,7 @@ async def schedule_booking(
             child_cnt=request.child_cnt,
             senior_cnt=request.senior_cnt,
             disabled_cnt=request.disabled_cnt,
+            **{key: getattr(request, key) for key in OPENING_FIELDS},
             interval_minutes=request.interval_minutes,
             max_attempts=request.max_attempts,
             time=request.time,
@@ -531,6 +492,30 @@ async def resume_task(
         _raise_task_operation_error(exc)
 
 
+class ResolveBookingRequest(BaseModel):
+    booked: bool
+    pnr: Optional[str] = Field(None, pattern=r"^[0-9]{8}$")
+
+    @model_validator(mode="after")
+    def check_pnr(self):
+        if self.booked != bool(self.pnr):
+            raise ValueError('已訂成必須填寫 8 位 PNR；未訂成不可填寫 PNR')
+        return self
+
+
+@app.post("/tasks/{task_id}/resolve", response_model=TaskStatusResponse)
+async def resolve_booking(task_id: str, request: ResolveBookingRequest,
+                          current_user_id: Optional[str] = Depends(get_current_user)):
+    if not current_user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        task = get_scheduler().resolve_confirmation(task_id,
+            _task_user_check_id(current_user_id), request.pnr)
+        return _task_to_status_response(task)
+    except (TaskNotFoundError, TaskOwnershipError, TaskStateError) as exc:
+        _raise_task_operation_error(exc)
+
+
 @app.put("/tasks/{task_id}", response_model=TaskStatusResponse)
 async def update_task(
     task_id: str,
@@ -559,6 +544,7 @@ async def update_task(
             seat_prefer=request.seat_prefer,
             class_type=request.class_type,
             no_ocr=request.no_ocr,
+            **{key: getattr(request, key) for key in OPENING_FIELDS},
             interval_minutes=request.interval_minutes,
             max_attempts=request.max_attempts,
         )
@@ -669,6 +655,8 @@ _thsr_connectivity_cache = {
 
 def _booking_task_to_result(task: BookingTask) -> Dict[str, object]:
     return {
+        **get_scheduler().execution_info(task),
+        **{key: task.to_dict()[key] for key in (*OPENING_FIELDS, "needs_confirmation")},
         "id": task.id,
         "status": task.status.value,
         "from_station": task.from_station,
@@ -891,12 +879,8 @@ async def get_task_result(
         # Detailed task information
         result = _booking_task_to_result(task)
         
-        # Calculate next attempt time if task is active
-        if task.status.value in ['pending', 'waiting', 'running', 'pausing'] and task.last_attempt:
-            from datetime import timedelta
-            next_attempt = task.last_attempt + timedelta(minutes=task.interval_minutes)
-            result["next_attempt"] = next_attempt.isoformat()
-        
+        result["next_attempt"] = result["next_attempt_at"]
+
         return {"success": True, "task": result}
     except HTTPException:
         raise

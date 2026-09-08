@@ -83,7 +83,8 @@ class THSRApiClient:
         seat_prefer: Optional[int] = None,
         class_type: Optional[int] = None,
         interval_minutes: int = 5,
-        max_attempts: Optional[int] = None
+        max_attempts: Optional[int] = None,
+        **opening_settings,
     ) -> Dict[str, Any]:
         """Create a new scheduled booking task."""
         
@@ -96,6 +97,7 @@ class THSRApiClient:
             "interval_minutes": interval_minutes
         }
         
+        payload.update(opening_settings)
         # Add optional parameters
         if adult_cnt is not None:
             payload["adult_cnt"] = adult_cnt
@@ -327,6 +329,10 @@ def schedule_booking_via_api(args) -> None:
             use_membership=args.use_membership,
             adult_cnt=adult_cnt,
             student_cnt=student_cnt,
+            opening_mode=getattr(args, 'opening_mode', False),
+            sales_open_at=getattr(args, 'sales_open_at', None),
+            burst_minutes=getattr(args, 'burst_minutes', 2),
+            burst_retry_seconds=getattr(args, 'burst_retry_seconds', 5),
             interval_minutes=getattr(args, 'interval', 5),
             max_attempts=getattr(args, 'max_attempts', None),
             time=getattr(args, 'time', None),

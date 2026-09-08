@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import math
 import time
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
@@ -8,6 +9,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests
+from .worker_protocol import check_cooldown, defer_until
 
 
 BASE_URL = "https://irs.thsrc.com.tw"
@@ -56,6 +58,18 @@ def booking_headers() -> dict:
     }
 
 
+class BookingSession(requests.Session):
+    def request(self, method, url, **kwargs):
+        check_cooldown()
+        response = super().request(method, url, **kwargs)
+        delay = retry_after_seconds(response)
+        if response.status_code == 429:
+            delay = delay if delay is not None else 30.0
+        if delay is not None:
+            defer_until(time.time() + delay)
+        return response
+
+
 def create_booking_session(
     impersonate: Optional[str] = None,
     logger: Callable[[str], None] = print,
@@ -71,7 +85,7 @@ def create_booking_session(
             f"{configured!r}; falling back to {DEFAULT_BROWSER_IMPERSONATE}."
         )
 
-    session = requests.Session(impersonate=browser)
+    session = BookingSession(impersonate=browser)
     session.headers.update(booking_headers())
     session.max_redirects = 20
     setattr(session, "_thsr_browser_impersonate", browser)
@@ -165,7 +179,7 @@ def retry_after_seconds(
     response: requests.Response,
     now_epoch: Optional[float] = None,
 ) -> Optional[float]:
-    """Parse Retry-After seconds or HTTP date and cap it at 30 seconds."""
+    """Preserve the server's full cooldown, including long Retry-After values."""
     value = response.headers.get("Retry-After")
     if not value:
         return None
@@ -179,7 +193,7 @@ def retry_after_seconds(
             seconds = retry_at.timestamp() - current_time
         except (TypeError, ValueError, OverflowError):
             return None
-    return min(max(seconds, 1.0), 30.0)
+    return max(seconds, 0.0) if math.isfinite(seconds) else None
 
 
 def establish_booking_session(
@@ -263,7 +277,9 @@ def establish_booking_session(
                     elapsed_seconds=monotonic() - started_at,
                     browser_impersonate=browser,
                 )
-            server_delay = retry_after_seconds(response, now_epoch=wall_time()) or 0.0
+            server_delay = retry_after_seconds(response, now_epoch=wall_time())
+            if server_delay is None:
+                server_delay = 30.0 if response.status_code == 429 else 0.0
         except requests.exceptions.RequestException as exc:
             last_classification = "connection-error"
             last_title = "(no response)"
