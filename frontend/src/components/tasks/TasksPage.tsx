@@ -137,6 +137,21 @@ const TasksPage: React.FC = () => {
     },
   });
 
+  const resolveMutation = useMutation(thsrApi.resolveBooking, {
+    onSuccess: () => { toast.success('訂票結果已更新'); invalidateTaskQueries(); },
+    onError: (error: Error) => { toast.error(error.message); },
+  });
+  const resolveBooking = (task: BookingTask, booked: boolean) => {
+    if (booked) {
+      const pnr = window.prompt('請填入高鐵已成立訂位的 8 位 PNR');
+      if (pnr === null) return;
+      if (!/^[0-9]{8}$/.test(pnr.trim())) { toast.error('PNR 必須是 8 位數字'); return; }
+      resolveMutation.mutate({id: task.id, booked, pnr: pnr.trim()});
+    } else if (window.confirm('已向高鐵確認沒有成立訂位？確認後系統可能立即重新訂票。')) {
+      resolveMutation.mutate({id: task.id, booked});
+    }
+  };
+
   // Cancel task mutation
   const cancelTaskMutation = useMutation(thsrApi.cancelTask, {
     onSuccess: () => {
@@ -160,13 +175,13 @@ const TasksPage: React.FC = () => {
   });
 
   const handleCancelTask = (taskId: string) => {
-    if (window.confirm('確定要取消這個任務嗎？')) {
+    if (window.confirm('確定要取消這個任務嗎？這不會取消可能已成立的高鐵訂位。')) {
       cancelTaskMutation.mutate(taskId);
     }
   };
 
   const handleRemoveTask = (taskId: string) => {
-    if (window.confirm('確定要刪除這個任務嗎？此操作無法復原。')) {
+    if (window.confirm('確定要刪除這個任務嗎？這不會取消可能已成立的高鐵訂位。此操作無法復原。')) {
       removeTaskMutation.mutate(taskId);
     }
   };
@@ -313,7 +328,7 @@ const TasksPage: React.FC = () => {
                       <div className={`flex items-center gap-2 ${getStatusColor(effectiveStatus)}`}>
                         {getStatusIcon(effectiveStatus)}
                         <span className="font-medium">
-                          {BOOKING_STATUS[effectiveStatus as keyof typeof BOOKING_STATUS]}
+                          {({waiting_opening: '等待開賣', waiting_resource: '等待執行資源', waiting_retry: '等待下次重試', needs_confirmation: '訂票結果待確認'} as Record<string, string>)[task.execution_phase || ''] || BOOKING_STATUS[effectiveStatus as keyof typeof BOOKING_STATUS]}
                         </span>
                       </div>
                       <span className="text-text-muted text-sm">
@@ -400,6 +415,20 @@ const TasksPage: React.FC = () => {
                       </div>
                     )}
 
+                    {task.opening_mode && <div className="text-sm text-text-secondary mb-3 space-y-1">
+                      <p>{task.in_burst ? '開賣搶票中' : '開賣搶票模式'}：{task.sales_open_at && formatDateTimeWithTimezone(task.sales_open_at)}</p>
+                      <p>快速期間 {task.burst_minutes} 分鐘，每輪失敗後等 {task.burst_retry_seconds} 秒</p>
+                      <p>本帳號同時開賣 {task.same_opening_tasks || 0} 筆；系統最多並行 {task.concurrency_limit || 2} 筆</p>
+                      {task.warmup_warning && <p className="text-rog-warning">OCR 預熱未完成，執行時將重試載入</p>}
+                    </div>}
+                    {task.next_attempt_at && <p className="text-text-muted text-sm">下次可執行：{formatDateTimeWithTimezone(task.next_attempt_at)}</p>}
+                    {task.needs_confirmation && <div className="border border-rog-warning rounded p-3 my-3 space-y-3">
+                      <p className="text-rog-warning">確認請求可能已送出，請先向高鐵查詢訂位結果，避免重複訂票。</p>
+                      <div className="flex flex-wrap gap-2">
+                        <button className="rog-btn rog-btn-secondary" disabled={resolveMutation.isLoading} onClick={() => resolveBooking(task, false)}>確認未訂成，繼續</button>
+                        <button className="rog-btn rog-btn-primary" disabled={resolveMutation.isLoading} onClick={() => resolveBooking(task, true)}>確認已訂成，填入 PNR</button>
+                      </div>
+                    </div>}
                     {task.last_attempt && (
                       <p className="text-text-muted text-sm">
                         上次實際執行：{formatDateTimeWithTimezone(task.last_attempt)}
@@ -421,7 +450,7 @@ const TasksPage: React.FC = () => {
                       </button>
                     )}
 
-                    {effectiveStatus === 'paused' && (
+                    {effectiveStatus === 'paused' && !task.needs_confirmation && (
                       <>
                         <button
                           onClick={() => resumeTaskMutation.mutate(task.id)}

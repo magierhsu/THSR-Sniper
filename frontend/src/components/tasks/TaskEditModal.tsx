@@ -1,3 +1,5 @@
+import OpeningFields from '@/components/booking/OpeningFields';
+import { openingLocal, openingPayload } from '@/utils/opening';
 import React from 'react';
 import { XMarkIcon } from '@heroicons/react/24/outline';
 import { useForm } from 'react-hook-form';
@@ -40,11 +42,16 @@ const TaskEditModal: React.FC<TaskEditModalProps> = ({
   const queryClient = useQueryClient();
   const {
     register,
+    setValue,
     handleSubmit,
     watch,
     formState: { errors },
   } = useForm<BookingFormData>({
     defaultValues: {
+      opening_mode: task.opening_mode || false,
+      sales_open_at: openingLocal(task.sales_open_at),
+      burst_minutes: task.burst_minutes || 2,
+      burst_retry_seconds: task.burst_retry_seconds || 5,
       fromStation: task.from_station,
       toStation: task.to_station,
       date: task.date.replace(/\//g, '-'),
@@ -126,6 +133,7 @@ const TaskEditModal: React.FC<TaskEditModalProps> = ({
       seat_prefer: Number(data.seatPreference),
       class_type: Number(data.classType),
       no_ocr: !data.useOCR,
+      ...openingPayload(data),
       interval_minutes: Number(data.intervalMinutes),
       max_attempts: data.maxAttempts ? Number(data.maxAttempts) : undefined,
     });
@@ -156,6 +164,7 @@ const TaskEditModal: React.FC<TaskEditModalProps> = ({
         </div>
 
         <div className="p-5 space-y-6">
+          <OpeningFields register={register} watch={watch} errors={errors} setValue={setValue} />
           <section>
             <h3 className="text-base font-semibold text-text-primary mb-3">行程資訊</h3>
             <div className="form-grid">

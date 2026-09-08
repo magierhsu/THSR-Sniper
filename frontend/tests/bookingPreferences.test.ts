@@ -71,6 +71,10 @@ test('restores every valid booking field', () => {
   );
 
   assert.deepEqual(defaults, {
+    opening_mode: false,
+    sales_open_at: '',
+    burst_minutes: 2,
+    burst_retry_seconds: 5,
     fromStation: 2,
     toStation: 7,
     date: '2026-09-25',
@@ -155,7 +159,7 @@ test('builds the versioned API payload without personal information', () => {
   };
 
   const payload = buildBookingPreferences(form, ['825', '838']);
-  assert.deepEqual(payload, preferences);
+  assert.deepEqual(payload, {...preferences, opening_mode: false, sales_open_at: null, burst_minutes: 2, burst_retry_seconds: 5});
   assert.equal('personal_id' in payload, false);
   assert.equal('use_membership' in payload, false);
 });

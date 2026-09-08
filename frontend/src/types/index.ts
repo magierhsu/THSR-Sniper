@@ -1,3 +1,19 @@
+export interface OpeningSettings {
+  opening_mode?: boolean;
+  sales_open_at?: string | null;
+  burst_minutes?: number;
+  burst_retry_seconds?: number;
+}
+export interface ExecutionInfo extends OpeningSettings {
+  needs_confirmation?: boolean;
+  execution_phase?: string;
+  in_burst?: boolean;
+  next_attempt_at?: string | null;
+  concurrency_limit?: number;
+  same_opening_tasks?: number;
+  warmup_warning?: boolean;
+}
+
 // User and Authentication Types
 export interface User {
   id: number;
@@ -51,7 +67,7 @@ export interface THSRInfo {
   use_membership: boolean;
 }
 
-export interface BookingPreferences {
+export interface BookingPreferences extends OpeningSettings {
   version: 1;
   from_station: number;
   to_station: number;
@@ -107,7 +123,7 @@ export interface BookingRequest {
   no_ocr?: boolean;
 }
 
-export interface ScheduledBookingRequest extends BookingRequest {
+export interface ScheduledBookingRequest extends BookingRequest, OpeningSettings {
   interval_minutes: number;
   max_attempts?: number;
 }
@@ -121,7 +137,7 @@ export interface BookingResponse {
   task_id?: string;
 }
 
-export interface TaskStatusResponse {
+export interface TaskStatusResponse extends ExecutionInfo {
   id: string;
   status: string;
   from_station: number;
@@ -149,7 +165,7 @@ export interface TaskStatusResponse {
   disabled_cnt?: number;
 }
 
-export interface BookingTask {
+export interface BookingTask extends ExecutionInfo {
   id: string;
   status: 'pending' | 'running' | 'pausing' | 'paused' | 'success' | 'failed' | 'cancelled' | 'expired' | 'waiting';
   from_station: number;
@@ -208,7 +224,7 @@ export interface BookingStats {
 }
 
 // Form Types
-export interface BookingFormData {
+export interface BookingFormData extends OpeningSettings {
   fromStation: number;
   toStation: number;
   date: string;

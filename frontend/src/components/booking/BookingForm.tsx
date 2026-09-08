@@ -1,3 +1,5 @@
+import OpeningFields from './OpeningFields';
+import { openingPayload } from '@/utils/opening';
 import React, { useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { useMutation, useQueryClient } from 'react-query';
@@ -47,6 +49,7 @@ const BookingForm: React.FC<BookingFormProps> = ({
   
   const {
     register,
+    setValue,
     handleSubmit,
     watch,
     formState: { errors },
@@ -225,6 +228,7 @@ const BookingForm: React.FC<BookingFormProps> = ({
     } else {
       const scheduledData = {
         ...bookingData,
+        ...openingPayload(data),
         interval_minutes: Number(data.intervalMinutes),
         max_attempts: data.maxAttempts ? Number(data.maxAttempts) : undefined,
       };
@@ -608,6 +612,7 @@ const BookingForm: React.FC<BookingFormProps> = ({
       </div>
 
       {/* Scheduled Booking Settings */}
+      <OpeningFields register={register} watch={watch} errors={errors} setValue={setValue} />
       {bookingMode === 'scheduled' && (
         <div className="rog-card border-rog-primary/30 bg-rog-primary/5">
           <div className="rog-card-header">

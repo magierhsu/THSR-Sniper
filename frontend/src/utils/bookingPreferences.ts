@@ -1,3 +1,4 @@
+import { openingLocal, openingPayload } from './opening';
 import {
   BookingFormData,
   BookingPreferences,
@@ -111,6 +112,11 @@ export const buildBookingFormDefaults = (
     : 30;
 
   return {
+    opening_mode: preferences?.opening_mode === true,
+    sales_open_at: preferences?.sales_open_at && Date.parse(preferences.sales_open_at) > Date.now()
+      ? openingLocal(preferences.sales_open_at) : '',
+    burst_minutes: integerInRange(preferences?.burst_minutes, 1, 5) ?? 2,
+    burst_retry_seconds: integerInRange(preferences?.burst_retry_seconds, 3, 10) ?? 5,
     fromStation,
     toStation,
     date: storedDate,
@@ -141,6 +147,7 @@ export const buildBookingPreferences = (
   preferredTrainNumbers: string[],
 ): BookingPreferences => ({
   version: 1,
+  ...openingPayload(form),
   from_station: Number(form.fromStation),
   to_station: Number(form.toStation),
   date: form.date,

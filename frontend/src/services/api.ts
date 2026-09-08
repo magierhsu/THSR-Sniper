@@ -393,6 +393,11 @@ export const authApi = {
 
 // THSR Booking API
 export const thsrApi = {
+  async resolveBooking({id, booked, pnr}: {id: string; booked: boolean; pnr?: string}): Promise<TaskStatusResponse> {
+    const response = await apiClient.post(`/tasks/${id}/resolve`, {booked, pnr});
+    return response.data;
+  },
+
   async getStations(): Promise<StationInfo[]> {
     try {
       const response = await apiClient.get('/stations');
