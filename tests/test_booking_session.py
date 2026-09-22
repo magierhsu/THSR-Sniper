@@ -99,6 +99,19 @@ class BookingSessionTests(unittest.TestCase):
                 classification, _title = classify_session_response(response)
                 self.assertEqual(expected, classification)
 
+    def test_endpoint_response_classification(self):
+        cases = (
+            ("captcha", FakeResponse(text="binary image"), "captcha-image"),
+            ("query", FakeResponse(text="<form name='BookingS2Form'></form>"), "query-page"),
+            ("train_selection", FakeResponse(text="<form name='BookingS3Form'></form>"), "train-selection-page"),
+            ("confirmation", FakeResponse(text="<p class='pnr-code'><span>hidden</span></p>"), "confirmation-page"),
+            ("confirmation", FakeResponse(text="<span class='feedbackPanelERROR'>error</span>"), "confirmation-error"),
+        )
+        for endpoint, response, expected in cases:
+            with self.subTest(endpoint=endpoint):
+                classification, _title = classify_session_response(response, endpoint)
+                self.assertEqual(expected, classification)
+
     def test_retry_after_supports_seconds_and_http_dates(self):
         seconds_response = FakeResponse(headers={"Retry-After": "45"})
         self.assertEqual(45.0, retry_after_seconds(seconds_response))
