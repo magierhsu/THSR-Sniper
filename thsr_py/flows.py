@@ -10,6 +10,7 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 from curl_cffi import requests
 from .worker_protocol import WorkerResult, check_cooldown, confirmation_permission, cooldown_until
+from . import diagnostics
 
 from .booking_session import (
     BASE_URL,
@@ -230,6 +231,7 @@ def _run_with_session(args, session) -> None:
 
     # Security code image
     result.stage = 'captcha'
+    diagnostics.stage('captcha')
     _print_section("Step 2: Security Verification")
     img_src = soup.select_one("#BookingS1Form_homeCaptcha_passCode").get("src")
     img_url = f"{BASE_URL}{img_src}"
@@ -292,10 +294,12 @@ def _run_with_session(args, session) -> None:
     payload.select_seat_prefer(getattr(args, "seat_prefer", None))
     payload.select_class_type(getattr(args, "class_type", None))
 
+    diagnostics.stage('ocr')
     payload.input_security_code(img_r.content, not getattr(args, "no_ocr", False))
 
     # Submit booking request
     result.stage = 'query'
+    diagnostics.stage('query')
     _print_section("Step 4: Submitting Booking Request")
     print("Sending booking request...")
     
@@ -315,11 +319,13 @@ def _run_with_session(args, session) -> None:
     soup = BeautifulSoup(r.text, "html.parser")
     err = _parse_error(soup)
     if err:
+        diagnostics.rejection(err)
         print(f"✗ Booking error: {err}")
         return
 
     # Second page
     result.stage = 'train-selection'
+    diagnostics.stage('train-selection')
     _print_section("Step 5: Train Selection")
     train_index = getattr(args, "train_index", None)
     preferred_train_numbers = getattr(args, "preferred_train_numbers", [])
@@ -338,6 +344,7 @@ def _run_with_session(args, session) -> None:
 
     # Final page
     result.stage = 'confirmation'
+    diagnostics.stage('confirmation')
     _print_section("Step 6: Final Confirmation")
     soup = _confirm_ticket_flow(session, soup, args)
     if soup is None:
@@ -572,6 +579,7 @@ def _confirm_train_flow(
 
     trains = _parse_trains(soup)
     if not trains:
+        diagnostics.emit('selection_failed', classification='no_trains')
         print("✗ Error: No trains available for the selected criteria")
         return None
     
@@ -618,6 +626,7 @@ def _confirm_train_flow(
                 f"(within {time_range_minutes} minutes after the query time)"
             )
         else:
+            diagnostics.emit('selection_failed', classification='outside_time_range')
             print(
                 f"✗ Error: No trains depart between the query time and "
                 f"{time_range_minutes} minutes after it"
@@ -638,6 +647,7 @@ def _confirm_train_flow(
     soup = BeautifulSoup(r.text, "html.parser")
     err = _parse_error(soup)
     if err:
+        diagnostics.rejection(err)
         print(f"✗ Error: {err}")
         return None
     return soup
@@ -697,6 +707,7 @@ def _confirm_ticket_flow(session: requests.Session, soup: BeautifulSoup, args) -
     print("Processing final confirmation...")
     check_cooldown()
     confirmation_permission()
+    diagnostics.emit('confirmation_authorized')
     result = getattr(args, '_booking_result', WorkerResult())
     result.uncertain = True
     r = session.post(
@@ -715,6 +726,7 @@ def _confirm_ticket_flow(session: requests.Session, soup: BeautifulSoup, args) -
     err = _parse_error(soup)
     if err:
         result.uncertain = False
+        diagnostics.rejection(err)
         result.error = err
         print(f"✗ Error: {err}")
         return None

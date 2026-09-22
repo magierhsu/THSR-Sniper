@@ -21,6 +21,7 @@ import os
 from .flows import run as run_booking_flow
 from .opening import OPENING_FIELDS, utc, validate_opening
 from .worker_protocol import WorkerResult, configure, cooldown_until
+from . import diagnostics
 from .schema import (
     MAX_DEPARTURE_TIME_RANGE_MINUTES,
     MAX_PREFERRED_TRAIN_NUMBERS,
@@ -74,6 +75,10 @@ def _initialize_worker(cooldown, ready):
 
 def _run_booking_flow_worker(args) -> WorkerResult | tuple[str, str, Optional[str]]:
     """Run one booking flow in an isolated process."""
+    token = diagnostics.begin(getattr(args, '_task_id', None),
+                              getattr(args, '_run_id', str(uuid.uuid4())),
+                              getattr(args, '_attempt', None),
+                              getattr(args, '_dispatched_at', None))
     stdout_buffer = io.StringIO()
     stderr_buffer = io.StringIO()
     original_non_interactive = os.environ.get("THSR_NON_INTERACTIVE")
@@ -89,7 +94,12 @@ def _run_booking_flow_worker(args) -> WorkerResult | tuple[str, str, Optional[st
             run_booking_flow(args)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
+        diagnostics.emit('attempt_exception', error_type=type(exc).__name__)
     finally:
+        result = getattr(args, '_booking_result', None)
+        outcome = ('success' if result and result.pnr else
+                   'needs_confirmation' if result and result.uncertain else 'failed')
+        diagnostics.finish(token, outcome, cooldown_until())
         if original_non_interactive is None:
             os.environ.pop("THSR_NON_INTERACTIVE", None)
         else:
@@ -1015,6 +1025,10 @@ class BookingScheduler:
                 task.status = BookingStatus.RUNNING
                 task.last_attempt = attempt_time
                 task.attempts += 1
+                args._task_id = task.id
+                args._run_id = str(uuid.uuid4())
+                args._attempt = task.attempts
+                args._dispatched_at = time.monotonic()
                 try:
                     if not self._save_tasks_locked():
                         raise RuntimeError('無法保存任務，未派發訂票')

@@ -10,6 +10,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 from bs4 import BeautifulSoup
 from curl_cffi import requests
 from .worker_protocol import check_cooldown, defer_until
+from . import diagnostics
 
 
 BASE_URL = "https://irs.thsrc.com.tw"
@@ -60,13 +61,42 @@ def booking_headers() -> dict:
 
 class BookingSession(requests.Session):
     def request(self, method, url, **kwargs):
-        check_cooldown()
-        response = super().request(method, url, **kwargs)
+        url_lower = url.lower()
+        endpoint = ('captcha' if 'captcha' in url_lower else
+                    'query' if 'BookingS1Form' in url else
+                    'train_selection' if 'BookingS2Form' in url else
+                    'confirmation' if 'BookingS3Form' in url else
+                    'booking_entry' if url == BOOKING_PAGE_URL else 'other_resource')
+        started = time.monotonic()
+        diagnostics.emit('http_started', endpoint=endpoint, method=method)
+        try:
+            check_cooldown()
+            response = super().request(method, url, **kwargs)
+        except Exception as exc:
+            diagnostics.emit('http_exception', endpoint=endpoint, method=method,
+                             error_type=type(exc).__name__,
+                             duration_ms=round((time.monotonic() - started) * 1000, 2))
+            raise
+        diagnostics.emit('http_response', endpoint=endpoint, method=method,
+                         http_status=response.status_code,
+                         duration_ms=round((time.monotonic() - started) * 1000, 2))
+        if endpoint in ('captcha', 'query', 'train_selection', 'confirmation'):
+            try:
+                classification, _ = classify_session_response(response, endpoint)
+                diagnostics.emit('http_classified', endpoint=endpoint,
+                                 classification=classification if classification != 'unexpected-page'
+                                 else 'other-html',
+                                 basis='http_status' if response.status_code == 429 or response.status_code >= 500
+                                 else 'text_heuristic_or_form')
+            except Exception:
+                diagnostics.emit('http_classified', endpoint=endpoint, classification='unknown')
         delay = retry_after_seconds(response)
         if response.status_code == 429:
             delay = delay if delay is not None else 30.0
         if delay is not None:
             defer_until(time.time() + delay)
+            diagnostics.emit('cooldown', retry_delay_ms=delay * 1000,
+                             retry_at=time.time() + delay)
         return response
 
 
@@ -89,6 +119,7 @@ def create_booking_session(
     session.headers.update(booking_headers())
     session.max_redirects = 20
     setattr(session, "_thsr_browser_impersonate", browser)
+    diagnostics.emit('session_created', browser=browser)
     return session
 
 
@@ -137,8 +168,14 @@ def get_jsession_id(
     return None
 
 
-def classify_session_response(response: requests.Response) -> Tuple[str, str]:
-    """Classify a THSR session response without exposing response content."""
+def classify_session_response(
+    response: requests.Response,
+    endpoint: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Classify a THSR response without exposing response content."""
+    if endpoint == "captcha":
+        return "captcha-image", "(captcha image)"
+
     soup = BeautifulSoup(response.text or "", "html.parser")
     title = soup.title.get_text(" ", strip=True)[:120] if soup.title else "(no title)"
     searchable = f"{title} {soup.get_text(' ', strip=True)[:10000]}".lower()
@@ -172,6 +209,22 @@ def classify_session_response(response: requests.Response) -> Tuple[str, str]:
         return "maintenance-or-overloaded", title
     if soup.select_one("#BookingS1Form_homeCaptcha_passCode"):
         return "booking-page", title
+    if endpoint == "query":
+        if soup.select_one("[name*='BookingS2Form']") or "BookingS2Form" in str(soup):
+            return "query-page", title
+        if soup.select_one("span.feedbackPanelERROR"):
+            return "query-error", title
+    if endpoint == "train_selection":
+        if soup.select_one("[name*='BookingS3Form']") or "BookingS3Form" in str(soup):
+            return "train-selection-page", title
+        if soup.select_one("span.feedbackPanelERROR"):
+            return "train-selection-error", title
+    if endpoint == "confirmation":
+        if soup.select_one("p.pnr-code span"):
+            return "confirmation-page", title
+        if soup.select_one("span.feedbackPanelERROR"):
+            return "confirmation-error", title
+        return "confirmation-response", title
     return "unexpected-page", title
 
 
@@ -231,7 +284,11 @@ def establish_booking_session(
         if delay > 0:
             if elapsed + delay >= max_elapsed_seconds:
                 last_error = "Session retry budget exhausted before the next attempt"
+                diagnostics.emit('session_budget_exhausted', classification=last_classification,
+                                 retry_delay_ms=delay * 1000)
                 break
+            diagnostics.emit('session_retry', request_attempt=attempt_index + 1,
+                             classification=last_classification, retry_delay_ms=delay * 1000)
             logger(
                 f"Session retry {attempt_index + 1}/{max_attempts} in {delay:.0f}s..."
             )
@@ -254,6 +311,11 @@ def establish_booking_session(
             jsession_id = get_jsession_id(session, response)
             if classification == "booking-page" and not jsession_id:
                 classification = "missing-jsessionid"
+            diagnostics.emit('session_classified', request_attempt=attempts,
+                             http_status=response.status_code, classification=classification,
+                             basis='http_status' if response.status_code == 429 or response.status_code >= 500
+                             else 'text_heuristic' if classification in ('queue', 'maintenance-or-overloaded')
+                             else 'form_and_cookie_check')
 
             names = sorted(
                 set(cookie_names(session.cookies) + cookie_names(response.cookies))
@@ -281,6 +343,8 @@ def establish_booking_session(
             if server_delay is None:
                 server_delay = 30.0 if response.status_code == 429 else 0.0
         except requests.exceptions.RequestException as exc:
+            diagnostics.emit('session_exception', request_attempt=attempts,
+                             error_type=type(exc).__name__)
             last_classification = "connection-error"
             last_title = "(no response)"
             last_error = f"{type(exc).__name__}: {exc}"

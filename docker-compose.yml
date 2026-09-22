@@ -19,6 +19,11 @@ services:
 
   # THSR Booking API and sole scheduler service
   thsr-sniper-api:
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "10"
     build: .
     image: seanchangx/thsr-sniper:latest
     container_name: thsr-sniper-api
