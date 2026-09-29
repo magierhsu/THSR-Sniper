@@ -910,8 +910,13 @@ class BookingScheduler:
 
             if task.status in [BookingStatus.PENDING, BookingStatus.WAITING]:
                 task.status = BookingStatus.PAUSED
-            elif task.status in [BookingStatus.RUNNING, BookingStatus.OBSERVING]:
+            elif task.status == BookingStatus.RUNNING:
                 task.status = BookingStatus.PAUSING
+            elif task.status == BookingStatus.OBSERVING:
+                task.status = BookingStatus.PAUSING
+                # Leave the timed wait promptly; the completed worker will
+                # preserve the pause intent instead of issuing the opening GET.
+                self._signal_observation_shutdown_locked(task_id)
             elif task.status not in [BookingStatus.PAUSING, BookingStatus.PAUSED]:
                 raise TaskStateError(
                     f"Task cannot be paused from {task.status.value} status"
@@ -1033,6 +1038,10 @@ class BookingScheduler:
                     return False
             
             # Mark as deleted instead of removing
+                # A GET-only observation can be waiting until the opening
+                # timestamp. Interrupt it before releasing the task record so
+                # deleting through the API/CLI cannot hold a worker slot.
+                self._signal_observation_shutdown_locked(task_id)
                 task.status = BookingStatus.DELETED
                 self._save_tasks_locked()
                 self.logger.info(f"Marked task as deleted: {task_id}")

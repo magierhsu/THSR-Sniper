@@ -59,6 +59,14 @@ class FakeExecutor:
         return future
 
 
+class FakeControl:
+    def __init__(self):
+        self.messages = []
+
+    def send(self, message):
+        self.messages.append(message)
+
+
 class PreEntryObservationTests(unittest.TestCase):
     def test_api_accepts_only_explicit_pre_entry_options(self):
         base = dict(
@@ -203,6 +211,21 @@ class PreEntryObservationTests(unittest.TestCase):
         self.assertEqual(BookingStatus.FAILED, task.status)
         self.assertEqual('worker-error', task.observation_result['outcome'])
 
+    def test_removing_observing_task_interrupts_worker(self):
+        scheduler = BookingScheduler(enable_persistence=False)
+        task = BookingTask(
+            id='observe-delete', from_station=1, to_station=2, date='2030/09/20',
+            adult_cnt=1, time=1, opening_mode=True, sales_open_at=OPENING,
+            pre_entry_seconds=60, status=BookingStatus.OBSERVING,
+        )
+        scheduler.add_task(task)
+        control = FakeControl()
+        scheduler._controls[task.id] = (control, object())
+
+        self.assertTrue(scheduler.remove_task(task.id))
+        self.assertEqual(BookingStatus.DELETED, task.status)
+        self.assertEqual(['shutdown'], control.messages)
+
     def test_invalid_observation_result_is_ignored_when_loading(self):
         task = BookingTask.from_dict({
             'id': 'legacy', 'from_station': 1, 'to_station': 2,
@@ -231,6 +254,21 @@ class PreEntryObservationTests(unittest.TestCase):
         ))
         scheduler._collect_workers()
         self.assertEqual(BookingStatus.PAUSED, task.status)
+
+    def test_pausing_observing_task_interrupts_worker(self):
+        scheduler = BookingScheduler(enable_persistence=False)
+        task = BookingTask(
+            id='observe-pause', from_station=1, to_station=2, date='2030/09/20',
+            adult_cnt=1, time=1, opening_mode=True, sales_open_at=OPENING,
+            pre_entry_seconds=60, status=BookingStatus.OBSERVING,
+        )
+        scheduler.add_task(task)
+        control = FakeControl()
+        scheduler._controls[task.id] = (control, object())
+
+        scheduler.pause_task(task.id)
+        self.assertEqual(BookingStatus.PAUSING, task.status)
+        self.assertEqual(['shutdown'], control.messages)
 
     def test_interrupted_pausing_observer_preserves_pause_intent(self):
         scheduler = BookingScheduler(enable_persistence=False)
