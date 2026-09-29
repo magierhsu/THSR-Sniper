@@ -1396,7 +1396,11 @@ class BookingScheduler:
                         observation_outcome = (result.observation_result or {}).get('outcome')
                         if task.status not in (BookingStatus.CANCELLED, BookingStatus.DELETED):
                             if observation_outcome == 'interrupted':
-                                task.status = BookingStatus.WAITING
+                                task.status = (
+                                    BookingStatus.PAUSED
+                                    if task.status == BookingStatus.PAUSING
+                                    else BookingStatus.WAITING
+                                )
                             elif observation_outcome == 'worker-error':
                                 task.status = BookingStatus.PAUSED if task.status == BookingStatus.PAUSING else BookingStatus.FAILED
                             else:

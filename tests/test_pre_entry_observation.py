@@ -189,6 +189,28 @@ class PreEntryObservationTests(unittest.TestCase):
         scheduler._collect_workers()
         self.assertEqual(BookingStatus.PAUSED, task.status)
 
+    def test_interrupted_pausing_observer_preserves_pause_intent(self):
+        scheduler = BookingScheduler(enable_persistence=False)
+        executor = FakeExecutor()
+        scheduler._booking_executor = executor
+        task = BookingTask(
+            id='observe-interrupted', from_station=1, to_station=2, date='2030/09/20',
+            adult_cnt=1, time=1, opening_mode=True, sales_open_at=OPENING,
+            pre_entry_seconds=30,
+        )
+        scheduler.add_task(task)
+        Clock.current = OPENING - timedelta(seconds=20)
+        with patch('thsr_py.scheduler.datetime', Clock):
+            scheduler._process_tasks()
+        scheduler.pause_task(task.id)
+        executor.calls[0][2].set_result(WorkerResult(
+            observation=True,
+            error='Session 觀察已中斷',
+            observation_result={'outcome': 'interrupted'},
+        ))
+        scheduler._collect_workers()
+        self.assertEqual(BookingStatus.PAUSED, task.status)
+
     def test_restart_recovers_observing_task_to_waiting(self):
         with tempfile.TemporaryDirectory() as temp:
             path = str(Path(temp) / 'tasks.json')
