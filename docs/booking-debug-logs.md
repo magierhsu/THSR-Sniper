@@ -47,5 +47,7 @@ but remains a heuristic and does not prove that a server-side queue position
 was acquired. Cookie names are represented only by short hashes; cookie and
 token values are never persisted. A worker exception is recorded as `failed`,
 while an intentional service stop records `interrupted` and returns the task
-to `waiting`. A service restart also converts an interrupted `observing` task
-back to `waiting` so the observation can be scheduled again.
+to `waiting`. If all workers are occupied until opening, a waiting experiment
+is recorded as `window-missed` without sending a late request, so it cannot
+delay real booking tasks. A service restart also converts an interrupted
+`observing` task back to `waiting` so the observation can be scheduled again.

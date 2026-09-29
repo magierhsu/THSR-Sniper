@@ -257,7 +257,8 @@ def _run_pre_entry_observation_worker(args) -> WorkerResult:
             outcome = 'session-reused'
         elif post.ok:
             outcome = 'opening-session-ready'
-        elif post.classification == 'queue' or pre.classification == 'queue':
+        elif (post.classification == 'queue' or pre.classification == 'queue'
+              or pre_queue_token or post_queue_token):
             outcome = 'queue-or-waiting'
         elif post.classification in ('maintenance-or-overloaded', 'rate-limited'):
             outcome = 'opening-busy'
@@ -1181,6 +1182,22 @@ class BookingScheduler:
                         changed |= task.status != BookingStatus.WAITING
                         task.status = BookingStatus.WAITING
                         continue
+                    if now >= task.sales_open_at:
+                        # A queued observation that never acquired a worker
+                        # before opening must not consume a slot after T0 and
+                        # delay real booking tasks. Record the miss without
+                        # making any HTTP request.
+                        task.status = BookingStatus.OBSERVED
+                        task.observation_result = {
+                            'outcome': 'window-missed',
+                            'pre_entry_seconds': task.pre_entry_seconds,
+                            'late_start': True,
+                            'message': '開賣前沒有取得觀察 worker，未送出請求',
+                        }
+                        task.last_finished = now
+                        task.error_message = None
+                        changed = True
+                        continue
                     changed |= task.status != BookingStatus.PENDING
                     task.status = BookingStatus.PENDING
                     if task.id not in self._inflight:
@@ -1391,6 +1408,12 @@ class BookingScheduler:
                     task.last_finished = datetime.now(timezone.utc)
                     task.retry_not_before = datetime.fromtimestamp(result.retry_at, timezone.utc) if result.retry_at else None
                     if result.observation:
+                        if not isinstance(result.observation_result, dict):
+                            result.observation_result = {
+                                'outcome': 'worker-error',
+                                'error_type': 'invalid-observation-result',
+                            }
+                            result.error = result.error or 'Session 觀察結果格式無效'
                         task.observation_result = result.observation_result
                         task.error_message = result.error
                         observation_outcome = (result.observation_result or {}).get('outcome')

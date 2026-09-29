@@ -105,6 +105,31 @@ class PreEntryObservationTests(unittest.TestCase):
         self.assertIsNone(result.pnr)
         self.assertTrue(session.closed)
 
+    def test_queue_token_takes_precedence_over_busy_page_classification(self):
+        session = FakeSession()
+        handshakes = [
+            SessionHandshakeResult(
+                response=SimpleNamespace(status_code=503, cookies=session.cookies, text='Waiting Room'),
+                jsession_id=None, classification='maintenance-or-overloaded', title='busy',
+                attempts=1, elapsed_seconds=0.01, browser_impersonate='firefox',
+            ),
+            SessionHandshakeResult(
+                response=SimpleNamespace(status_code=503, cookies=session.cookies, text='Waiting Room'),
+                jsession_id=None, classification='maintenance-or-overloaded', title='busy',
+                attempts=1, elapsed_seconds=0.01, browser_impersonate='firefox',
+            ),
+        ]
+        args = SimpleNamespace(
+            _task_id='queue', _run_id='run', _attempt=0, _dispatched_at=None,
+            sales_open_at=OPENING, pre_entry_seconds=30,
+        )
+        with patch('thsr_py.scheduler.create_booking_session', return_value=session), \
+             patch('thsr_py.scheduler._observation_handshake', side_effect=handshakes), \
+             patch('thsr_py.scheduler._wait_until_epoch', return_value=False), \
+             patch('thsr_py.scheduler.has_queue_token', return_value=True):
+            result = _run_pre_entry_observation_worker(args)
+        self.assertEqual('queue-or-waiting', result.observation_result['outcome'])
+
     def test_scheduler_dispatches_observation_without_counting_attempt(self):
         with tempfile.TemporaryDirectory() as temp:
             scheduler = BookingScheduler(storage_path=str(Path(temp) / 'tasks.json'))
@@ -159,6 +184,24 @@ class PreEntryObservationTests(unittest.TestCase):
         scheduler._collect_workers()
         self.assertEqual(BookingStatus.FAILED, task.status)
         self.assertNotEqual(BookingStatus.OBSERVED, task.status)
+
+    def test_missing_observation_payload_is_treated_as_worker_error(self):
+        scheduler = BookingScheduler(enable_persistence=False)
+        executor = FakeExecutor()
+        scheduler._booking_executor = executor
+        task = BookingTask(
+            id='observe-invalid', from_station=1, to_station=2, date='2030/09/20',
+            adult_cnt=1, time=1, opening_mode=True, sales_open_at=OPENING,
+            pre_entry_seconds=30,
+        )
+        scheduler.add_task(task)
+        Clock.current = OPENING - timedelta(seconds=20)
+        with patch('thsr_py.scheduler.datetime', Clock):
+            scheduler._process_tasks()
+        executor.calls[0][2].set_result(WorkerResult(observation=True))
+        scheduler._collect_workers()
+        self.assertEqual(BookingStatus.FAILED, task.status)
+        self.assertEqual('worker-error', task.observation_result['outcome'])
 
     def test_invalid_observation_result_is_ignored_when_loading(self):
         task = BookingTask.from_dict({
@@ -249,6 +292,31 @@ class PreEntryObservationTests(unittest.TestCase):
         self.assertEqual(2, len(scheduler._inflight))
         self.assertEqual(BookingStatus.OBSERVED, scheduler.tasks[first_id].status)
         self.assertEqual(2, sum(task.status == BookingStatus.OBSERVING for task in scheduler.tasks.values()))
+
+    def test_queued_observation_is_marked_missed_after_opening(self):
+        scheduler = BookingScheduler(enable_persistence=False)
+        executor = FakeExecutor()
+        scheduler._booking_executor = executor
+        for index in range(3):
+            scheduler.add_task(BookingTask(
+                id=f'observe-{index}', from_station=1, to_station=2,
+                date='2030/09/20', adult_cnt=1, time=1,
+                opening_mode=True, sales_open_at=OPENING,
+                pre_entry_seconds=30,
+            ))
+        Clock.current = OPENING - timedelta(seconds=20)
+        with patch('thsr_py.scheduler.datetime', Clock):
+            scheduler._process_tasks()
+        self.assertEqual(2, len(scheduler._inflight))
+        queued = scheduler.tasks['observe-2']
+        self.assertEqual(BookingStatus.PENDING, queued.status)
+
+        Clock.current = OPENING
+        with patch('thsr_py.scheduler.datetime', Clock):
+            scheduler._process_tasks()
+        self.assertEqual(BookingStatus.OBSERVED, queued.status)
+        self.assertEqual('window-missed', queued.observation_result['outcome'])
+        self.assertEqual(2, len(scheduler._inflight))
 
 
 if __name__ == '__main__':

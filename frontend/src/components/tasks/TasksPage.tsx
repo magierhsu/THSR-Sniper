@@ -404,7 +404,9 @@ const TasksPage: React.FC = () => {
                     {(effectiveStatus === 'observed' || (effectiveStatus === 'success' && task.pre_entry_seconds && task.pre_entry_seconds > 0)) ? (
                       <div className="bg-rog-info/10 border border-rog-info/30 rounded-lg p-3 mb-3">
                         <p className="text-rog-info font-medium">
-                          Session 觀察完成，未送出查詢或訂票請求。
+                          {task.observation_result?.outcome === 'window-missed'
+                            ? '觀察窗口已錯過，未送出查詢或訂票請求。'
+                            : 'Session 觀察完成，未送出查詢或訂票請求。'}
                         </p>
                       </div>
                     ) : effectiveStatus === 'success' ? (
