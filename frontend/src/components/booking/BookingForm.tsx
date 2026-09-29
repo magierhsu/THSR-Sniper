@@ -117,9 +117,12 @@ const BookingForm: React.FC<BookingFormProps> = ({
     {
       onSuccess: async (response, variables) => {
         if (response.success) {
+          const isSessionObservation = Number(variables.request.pre_entry_seconds) > 0;
           await savePreferencesAndNavigate(
             variables.preferences,
-            `排程訂票已建立！任務ID：${response.task_id}`,
+            isSessionObservation
+              ? `Session 觀察任務已建立！任務ID：${response.task_id}`
+              : `排程訂票已建立！任務ID：${response.task_id}`,
           );
         } else {
           toast.error(`建立排程失敗：${response.message}`);
@@ -612,7 +615,7 @@ const BookingForm: React.FC<BookingFormProps> = ({
       </div>
 
       {/* Scheduled Booking Settings */}
-      <OpeningFields register={register} watch={watch} errors={errors} setValue={setValue} />
+      {bookingMode === 'scheduled' && <OpeningFields register={register} watch={watch} errors={errors} setValue={setValue} />}
       {bookingMode === 'scheduled' && (
         <div className="rog-card border-rog-primary/30 bg-rog-primary/5">
           <div className="rog-card-header">

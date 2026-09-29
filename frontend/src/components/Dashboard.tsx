@@ -14,6 +14,22 @@ const cleanPNR = (pnr: string | null | undefined): string => {
   return pnr.replace(/\u001b\[[0-9;]*m/g, '').trim();
 };
 
+const EXECUTION_PHASE_LABELS: Record<string, string> = {
+  waiting_opening: '等待開賣',
+  waiting_observation: '等待建立 Session',
+  waiting_resource: '等待執行資源',
+  waiting_retry: '等待下次重試',
+  pre_entry: '等待建立 Session',
+  observing: '觀察 Session 中',
+  observed: '觀察完成',
+  needs_confirmation: '訂票結果待確認',
+};
+
+const taskStatusLabel = (task: { status: string; execution_phase?: string }): string =>
+  EXECUTION_PHASE_LABELS[task.execution_phase || '']
+  || BOOKING_STATUS[task.status as keyof typeof BOOKING_STATUS]
+  || '未知';
+
 const Dashboard: React.FC = () => {
   const { user } = useAuthStore();
 
@@ -273,8 +289,11 @@ const Dashboard: React.FC = () => {
                 <div className="flex items-center gap-3">
                   <div className={`w-3 h-3 rounded-full ${
                     task.status === 'success' ? 'bg-rog-success' :
+                    task.status === 'observed' ? 'bg-rog-success' :
                     task.status === 'failed' ? 'bg-rog-danger' :
+                    task.status === 'observing' ? 'bg-rog-info animate-pulse' :
                     task.status === 'running' ? 'bg-rog-info animate-pulse' :
+                    task.status === 'pausing' ? 'bg-rog-info' :
                     task.status === 'waiting' ? 'bg-rog-info' :
                     'bg-rog-warning'
                   }`}></div>
@@ -290,17 +309,23 @@ const Dashboard: React.FC = () => {
                 <div className="text-right">
                   <p className={`text-sm font-medium ${
                     task.status === 'success' ? 'text-rog-success' :
+                    task.status === 'observed' ? 'text-rog-success' :
                     task.status === 'failed' ? 'text-rog-danger' :
+                    task.status === 'observing' ? 'text-rog-info' :
                     task.status === 'running' ? 'text-rog-info' :
+                    task.status === 'pausing' ? 'text-rog-info' :
                     task.status === 'waiting' ? 'text-rog-info' :
                     'text-rog-warning'
                   }`}>
-                    {BOOKING_STATUS[task.status as keyof typeof BOOKING_STATUS] || '未知'}
+                    {taskStatusLabel(task)}
                   </p>
                   {task.status === 'success' && (task.result || (task as any).success_pnr) && (
                     <p className="text-text-muted text-xs">
                       PNR: {cleanPNR(task.result || (task as any).success_pnr)}
                     </p>
+                  )}
+                  {task.status === 'observed' && (
+                    <p className="text-text-muted text-xs">Session 觀察完成，未送出訂票</p>
                   )}
                 </div>
               </div>

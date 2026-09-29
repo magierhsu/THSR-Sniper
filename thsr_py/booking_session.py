@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import math
 import time
+import hashlib
+import re
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from typing import Callable, List, Optional, Sequence, Tuple
@@ -143,6 +145,54 @@ def cookie_names(cookie_jar) -> List[str]:
     except (AttributeError, TypeError):
         pass
     return sorted(names)
+
+
+def cookie_names_hash(cookie_jar) -> str:
+    """Return a short, value-free fingerprint of cookie names for diagnostics."""
+    names = cookie_names(cookie_jar)
+    return hashlib.sha256(','.join(names).encode('utf-8')).hexdigest()[:16]
+
+
+def has_queue_token(cookie_jar, response=None) -> bool:
+    """Detect likely queue markers without exposing cookie names or values."""
+    jars = [cookie_jar]
+    if response is not None:
+        jars.append(getattr(response, 'cookies', None))
+    if any(
+        any(marker in name.lower() for marker in ('queue', 'wait', 'token'))
+        for jar in jars
+        for name in cookie_names(jar)
+    ):
+        return True
+
+    # Waiting-room implementations may keep their token in a hidden field or
+    # data attribute instead of a cookie. Inspect names/markers only; values
+    # and response bodies never leave the worker.
+    if response is None:
+        return False
+    text = str(getattr(response, 'text', '') or '')
+    lowered = text.lower()
+    queue_page = any(marker in lowered for marker in (
+        'queue-it', 'waiting room', 'waitingroom', '排隊', '等候進入', '流量管制',
+    ))
+    if not queue_page:
+        return False
+    if re.search(r'(queue|wait|waiting|position|排隊|等候)[^<>]{0,100}(token|id|position|number)', lowered):
+        return True
+    try:
+        soup = BeautifulSoup(text, 'html.parser')
+        for tag in soup.find_all(['input', 'meta']):
+            names = ' '.join(str(tag.get(attr, '')) for attr in ('name', 'id', 'class', 'content')).lower()
+            if any(marker in names for marker in ('queue', 'wait', 'position')):
+                return True
+        for tag in soup.find_all(True):
+            names = ' '.join(str(value) for key, value in tag.attrs.items()
+                             if key.startswith('data-') or key in ('id', 'class')).lower()
+            if any(marker in names for marker in ('queue', 'wait', 'position')):
+                return True
+    except Exception:
+        return False
+    return False
 
 
 def get_jsession_id(
@@ -319,6 +369,14 @@ def establish_booking_session(
 
             names = sorted(
                 set(cookie_names(session.cookies) + cookie_names(response.cookies))
+            )
+            diagnostics.emit(
+                'session_cookies',
+                cookie_names_hash=hashlib.sha256(','.join(names).encode('utf-8')).hexdigest()[:16],
+                queue_token_present=any(
+                    any(marker in name.lower() for marker in ('queue', 'wait', 'token'))
+                    for name in names
+                ),
             )
             logger(
                 f"Session response {attempts}/{max_attempts}: "

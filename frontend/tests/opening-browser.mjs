@@ -19,7 +19,7 @@ try {
       opening_mode:true,sales_open_at:'2030-09-01T16:00:00Z',burst_minutes:4,burst_retry_seconds:8};
     const task = {id:'browser-test',status:'paused',from_station:1,to_station:2,date:'2030/09/20',
       time:1,adult_cnt:1,child_cnt:2,interval_minutes:3,attempts:0,created_at:'2026-09-01T00:00:00Z',
-      ...prefs,needs_confirmation:false,execution_phase:'paused',same_opening_tasks:5,concurrency_limit:2};
+      ...prefs,pre_entry_seconds:30,needs_confirmation:false,execution_phase:'paused',same_opening_tasks:5,concurrency_limit:2};
     let saved, scheduled, remembered;
     await page.route(/\/(api|auth)\//, async route => {
       const path = new URL(route.request().url()).pathname;
@@ -42,15 +42,19 @@ try {
     assert.equal(await page.getByLabel('開賣日期（台灣時間）').inputValue(), '2030-09-02');
     assert.equal(await page.getByLabel('開賣時間（台灣時間）').inputValue(), '00:00');
     assert.equal(await page.locator('[name=burst_minutes]').inputValue(), '4');
+    await page.getByLabel('提前建立 Session（測試）').selectOption('30');
     await page.screenshot({path:`/tmp/thsr-opening-form-${viewport.width}.png`,fullPage:true});
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
     await page.locator('button[type=submit]').click();
     await page.waitForURL('**/tasks');
     assert.equal(scheduled.sales_open_at, '2030-09-01T16:00:00.000Z');
+    assert.equal(scheduled.pre_entry_seconds, 30);
     assert.equal(remembered.burst_retry_seconds, 8);
+    assert.equal('pre_entry_seconds' in remembered, false);
     await page.getByRole('button',{name:'修改內容',exact:true}).click();
     const dialog=page.getByRole('dialog');
     await dialog.waitFor();
+    assert.equal(await dialog.getByLabel('提前建立 Session（測試）').inputValue(), '30');
     await dialog.locator('[name=burst_minutes]').selectOption('5');
     await dialog.getByLabel('開賣時間（台灣時間）').fill('00:01');
     await page.screenshot({path:`/tmp/thsr-opening-edit-${viewport.width}.png`,fullPage:true});

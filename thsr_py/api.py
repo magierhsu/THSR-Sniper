@@ -159,11 +159,15 @@ class ScheduledBookingRequest(BookingRequest):
     sales_open_at: Optional[datetime] = None
     burst_minutes: int = Field(2, ge=1, le=5)
     burst_retry_seconds: int = Field(5, ge=3, le=10)
+    pre_entry_seconds: int = Field(
+        0,
+        description="GET-only Session observation window before opening: 0, 30, or 60 seconds",
+    )
 
     @model_validator(mode="after")
     def check_opening(self):
         self.sales_open_at = validate_opening(self.opening_mode, self.sales_open_at,
-            self.burst_minutes, self.burst_retry_seconds, self.date)
+            self.burst_minutes, self.burst_retry_seconds, self.date, self.pre_entry_seconds)
         return self
 
     interval_minutes: int = Field(5, ge=1, description="Booking attempt interval in minutes")
@@ -186,6 +190,7 @@ class TaskStatusResponse(BaseModel):
     sales_open_at: Optional[str] = None
     burst_minutes: int = 2
     burst_retry_seconds: int = 5
+    pre_entry_seconds: int = 0
     needs_confirmation: bool = False
     execution_phase: str = ''
     in_burst: bool = False
@@ -217,6 +222,8 @@ class TaskStatusResponse(BaseModel):
     last_attempt: Optional[str]
     success_pnr: Optional[str]
     error_message: Optional[str]
+    observation_result: Optional[Dict[str, object]] = None
+    last_finished: Optional[str] = None
     created_at: str
 
 
@@ -247,6 +254,8 @@ def _task_to_status_response(task: BookingTask) -> TaskStatusResponse:
         last_attempt=task.last_attempt.isoformat() if task.last_attempt else None,
         success_pnr=clean_ansi_codes(task.success_pnr),
         error_message=task.error_message,
+        observation_result=task.observation_result,
+        last_finished=task.last_finished.isoformat() if task.last_finished else None,
         created_at=task.created_at.isoformat(),
     )
 
@@ -684,6 +693,8 @@ def _booking_task_to_result(task: BookingTask) -> Dict[str, object]:
         "result": getattr(task, "result", None),
         "success_pnr": getattr(task, "success_pnr", None),
         "error": task.error_message,
+        "observation_result": task.observation_result,
+        "last_finished": task.last_finished.isoformat() if task.last_finished else None,
     }
 
 @app.get("/health/thsr")
@@ -752,8 +763,8 @@ async def get_results(
     status: Optional[str] = Query(
         None,
         description=(
-            "Filter by status (pending/waiting/running/pausing/paused/"
-            "success/failed/cancelled/expired)"
+            "Filter by status (pending/waiting/running/observing/observed/"
+            "pausing/paused/success/failed/cancelled/expired)"
         ),
     ),
     limit: int = Query(50, ge=1, le=1000, description="Maximum number of results"),
@@ -820,7 +831,10 @@ async def get_results_stats(current_user_id: Optional[str] = Depends(get_current
                 "total_attempts": 0,
                 "average_attempts": 0,
                 "status_breakdown": {},
-                "success_rate": 0
+                "success_rate": 0,
+                "completed_tasks": 0,
+                "observed_tasks": 0,
+                "active_tasks": 0
             }
         
         # Calculate statistics
@@ -833,8 +847,15 @@ async def get_results_stats(current_user_id: Optional[str] = Depends(get_current
             total_attempts += task.attempts
         
         success_count = status_count.get('success', 0)
-        completed_count = sum(status_count.get(s, 0) for s in ['success', 'failed', 'cancelled', 'expired'])
-        success_rate = (success_count / completed_count * 100) if completed_count > 0 else 0
+        booking_completed_count = sum(
+            status_count.get(s, 0) for s in ['success', 'failed', 'cancelled', 'expired']
+        )
+        observed_count = status_count.get('observed', 0)
+        completed_count = booking_completed_count + observed_count
+        success_rate = (
+            success_count / booking_completed_count * 100
+            if booking_completed_count > 0 else 0
+        )
         
         return {
             "success": True,
@@ -844,9 +865,10 @@ async def get_results_stats(current_user_id: Optional[str] = Depends(get_current
             "status_breakdown": status_count,
             "success_rate": round(success_rate, 2),
             "completed_tasks": completed_count,
+            "observed_tasks": observed_count,
             "active_tasks": sum(
                 status_count.get(status, 0)
-                for status in ['pending', 'waiting', 'running', 'pausing']
+                for status in ['pending', 'waiting', 'running', 'observing', 'pausing']
             )
         }
     except HTTPException:

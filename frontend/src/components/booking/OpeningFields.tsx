@@ -9,6 +9,7 @@ export default function OpeningFields({ register, watch, errors, setValue }: {
 }) {
   const enabled = watch('opening_mode');
   const value = watch('sales_open_at') || '';
+  const preEntrySeconds = watch('pre_entry_seconds') || 0;
   const [date, time = '00:00'] = value.split('T');
   return <section className="p-4 border border-gray-700 rounded-lg space-y-4">
     <label className="flex items-center gap-3 text-text-primary">
@@ -43,6 +44,26 @@ export default function OpeningFields({ register, watch, errors, setValue }: {
           <select className="rog-select" {...register('burst_retry_seconds', {valueAsNumber: true})}>
             {[3,4,5,6,7,8,9,10].map(n => <option key={n} value={n}>{n} 秒</option>)}
           </select>
+        </label>
+        <label className="form-group form-label">
+          提前建立 Session（測試）
+          <select
+            aria-label="提前建立 Session（測試）"
+            className="rog-select"
+            {...register('pre_entry_seconds', {
+              valueAsNumber: true,
+              validate: value => [0, 30, 60].includes(Number(value)) || '只能選擇關閉、30 或 60 秒',
+            })}
+          >
+            <option value={0}>關閉（開賣時建立）</option>
+            <option value={30}>提前 30 秒（只觀察 Session）</option>
+            <option value={60}>提前 60 秒（只觀察 Session）</option>
+          </select>
+          {preEntrySeconds > 0 && (
+            <span className="text-text-muted text-xs mt-1 block">
+              測試模式只會取得並觀察 Session，不會送出查詢、選車或訂票請求。
+            </span>
+          )}
         </label>
       </div>
     </>}

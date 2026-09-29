@@ -142,6 +142,7 @@ class SchedulerWatchdog:
             if task.status in [
                 BookingStatus.PENDING,
                 BookingStatus.RUNNING,
+                BookingStatus.OBSERVING,
                 BookingStatus.WAITING,
                 BookingStatus.PAUSING,
             ]
@@ -200,6 +201,7 @@ class SchedulerWatchdog:
             if task.status in [
                 BookingStatus.PENDING,
                 BookingStatus.RUNNING,
+                BookingStatus.OBSERVING,
                 BookingStatus.WAITING,
                 BookingStatus.PAUSING,
             ] and task.is_expired():

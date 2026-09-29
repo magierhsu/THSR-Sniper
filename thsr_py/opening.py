@@ -1,7 +1,15 @@
 """Opening-mode settings shared by API, CLI and scheduler."""
 from datetime import datetime, timedelta, timezone
 
-OPENING_FIELDS = ('opening_mode', 'sales_open_at', 'burst_minutes', 'burst_retry_seconds')
+OPENING_FIELDS = (
+    'opening_mode',
+    'sales_open_at',
+    'burst_minutes',
+    'burst_retry_seconds',
+    'pre_entry_seconds',
+)
+
+PRE_ENTRY_OPTIONS = (0, 30, 60)
 
 def utc(value):
     if value is None:
@@ -12,9 +20,13 @@ def utc(value):
         raise ValueError('開賣時間必須包含時區（台灣為 +08:00）')
     return value.astimezone(timezone.utc)
 
-def validate_opening(enabled, opening, minutes, seconds, date):
+def validate_opening(enabled, opening, minutes, seconds, date, pre_entry_seconds=0):
     if not 1 <= minutes <= 5 or not 3 <= seconds <= 10:
         raise ValueError('快速期間須為 1–5 分鐘，等待須為 3–10 秒')
+    if pre_entry_seconds not in PRE_ENTRY_OPTIONS:
+        raise ValueError('提前建立 Session 僅可選擇關閉、30 秒或 60 秒')
+    if pre_entry_seconds and not enabled:
+        raise ValueError('提前建立 Session 只能搭配開賣搶票模式')
     if not enabled:
         return None
     opening = utc(opening)

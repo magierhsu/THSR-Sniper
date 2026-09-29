@@ -117,6 +117,9 @@ export const buildBookingFormDefaults = (
       ? openingLocal(preferences.sales_open_at) : '',
     burst_minutes: integerInRange(preferences?.burst_minutes, 1, 5) ?? 2,
     burst_retry_seconds: integerInRange(preferences?.burst_retry_seconds, 3, 10) ?? 5,
+    // Pre-entry is an explicit per-task experiment and is never restored
+    // from the user's remembered booking form.
+    pre_entry_seconds: 0,
     fromStation,
     toStation,
     date: storedDate,
@@ -145,23 +148,31 @@ export const buildBookingFormDefaults = (
 export const buildBookingPreferences = (
   form: BookingFormData,
   preferredTrainNumbers: string[],
-): BookingPreferences => ({
-  version: 1,
-  ...openingPayload(form),
-  from_station: Number(form.fromStation),
-  to_station: Number(form.toStation),
-  date: form.date,
-  adult_cnt: Number(form.adultCount) || 0,
-  student_cnt: Number(form.studentCount) || 0,
-  child_cnt: Number(form.childCount) || 0,
-  senior_cnt: Number(form.seniorCount) || 0,
-  disabled_cnt: Number(form.disabledCount) || 0,
-  time: Number(form.departureTime),
-  time_range_minutes: Number(form.departureTimeRangeMinutes),
-  preferred_train_numbers: preferredTrainNumbers,
-  seat_prefer: Number(form.seatPreference),
-  class_type: Number(form.classType),
-  no_ocr: !form.useOCR,
-  interval_minutes: Number(form.intervalMinutes),
-  max_attempts: form.maxAttempts ? Number(form.maxAttempts) : null,
-});
+): BookingPreferences => {
+  const opening = openingPayload(form);
+  return {
+    version: 1,
+    // Keep only durable booking form fields. Experimental pre-entry settings
+    // must be chosen explicitly for each task.
+    opening_mode: opening.opening_mode,
+    sales_open_at: opening.sales_open_at,
+    burst_minutes: opening.burst_minutes,
+    burst_retry_seconds: opening.burst_retry_seconds,
+    from_station: Number(form.fromStation),
+    to_station: Number(form.toStation),
+    date: form.date,
+    adult_cnt: Number(form.adultCount) || 0,
+    student_cnt: Number(form.studentCount) || 0,
+    child_cnt: Number(form.childCount) || 0,
+    senior_cnt: Number(form.seniorCount) || 0,
+    disabled_cnt: Number(form.disabledCount) || 0,
+    time: Number(form.departureTime),
+    time_range_minutes: Number(form.departureTimeRangeMinutes),
+    preferred_train_numbers: preferredTrainNumbers,
+    seat_prefer: Number(form.seatPreference),
+    class_type: Number(form.classType),
+    no_ocr: !form.useOCR,
+    interval_minutes: Number(form.intervalMinutes),
+    max_attempts: form.maxAttempts ? Number(form.maxAttempts) : null,
+  };
+};

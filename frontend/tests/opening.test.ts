@@ -9,6 +9,21 @@ test('Taiwan midnight survives round trip independently of browser timezone', ()
   assert.equal(openingLocal(payload.sales_open_at), '2030-09-02T00:00');
 });
 
+test('pre-entry seconds are included only for an enabled opening task', () => {
+  const observation = openingPayload({
+    opening_mode: true,
+    sales_open_at: '2030-09-02T00:00',
+    pre_entry_seconds: 30,
+  });
+  assert.equal(observation.pre_entry_seconds, 30);
+
+  const disabled = openingPayload({
+    opening_mode: false,
+    pre_entry_seconds: 60,
+  });
+  assert.equal(disabled.pre_entry_seconds, 0);
+});
+
 test('past opening time is cleared but mode and valid burst settings are retained', () => {
   const defaults = buildBookingFormDefaults({version: 1, opening_mode: true, sales_open_at: '2000-01-01T00:00:00Z', burst_minutes: 4, burst_retry_seconds: 8}, [{id:1,name:'A'}, {id:2,name:'B'}], []);
   assert.equal(defaults.sales_open_at, '');

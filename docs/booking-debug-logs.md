@@ -30,3 +30,22 @@ No raw HTML, full URLs, request bodies, cookie values, captcha contents,
 personal identifiers, membership data, emails or PNR are added to these events.
 Exceptions record their class only. Existing application logs are separate
 from this new diagnostic stream. Diagnostic write failures do not abort booking.
+
+## Pre-entry Session observation
+
+An opening-mode task may set `pre_entry_seconds` to `30` or `60` (the default
+`0` disables it). The scheduler dispatches a dedicated worker at that offset,
+which keeps one curl session alive, performs one GET before opening and one GET
+at the configured opening time, then closes the session. It never runs OCR,
+sends a search/selection/confirmation POST, or increments `attempts`.
+
+The task ends in `observed` (or `paused` if it was paused while observing) and
+exposes a value-free `observation_result` with both response classifications,
+HTTP statuses, queue-token presence, and whether the same JSESSIONID was seen.
+Queue detection checks cookie names and queue-related hidden/data field names,
+but remains a heuristic and does not prove that a server-side queue position
+was acquired. Cookie names are represented only by short hashes; cookie and
+token values are never persisted. A worker exception is recorded as `failed`,
+while an intentional service stop records `interrupted` and returns the task
+to `waiting`. A service restart also converts an interrupted `observing` task
+back to `waiting` so the observation can be scheduled again.

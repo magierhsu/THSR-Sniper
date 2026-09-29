@@ -193,8 +193,11 @@ const TasksPage: React.FC = () => {
       case 'failed':
         return 'text-rog-danger';
       case 'running':
+      case 'observing':
       case 'pausing':
         return 'text-rog-info';
+      case 'observed':
+        return 'text-rog-success';
       case 'pending':
         return 'text-rog-warning';
       case 'waiting':
@@ -225,9 +228,16 @@ const TasksPage: React.FC = () => {
           </svg>
         );
       case 'running':
+      case 'observing':
         return (
           <svg className="w-4 h-4 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+          </svg>
+        );
+      case 'observed':
+        return (
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
           </svg>
         );
       case 'pausing':
@@ -328,7 +338,7 @@ const TasksPage: React.FC = () => {
                       <div className={`flex items-center gap-2 ${getStatusColor(effectiveStatus)}`}>
                         {getStatusIcon(effectiveStatus)}
                         <span className="font-medium">
-                          {({waiting_opening: '等待開賣', waiting_resource: '等待執行資源', waiting_retry: '等待下次重試', needs_confirmation: '訂票結果待確認'} as Record<string, string>)[task.execution_phase || ''] || BOOKING_STATUS[effectiveStatus as keyof typeof BOOKING_STATUS]}
+                          {({waiting_opening: '等待開賣', waiting_observation: '等待建立 Session', waiting_resource: '等待執行資源', waiting_retry: '等待下次重試', pre_entry: '等待建立 Session', observing: '觀察 Session 中', observed: '觀察完成', needs_confirmation: '訂票結果待確認'} as Record<string, string>)[task.execution_phase || ''] || BOOKING_STATUS[effectiveStatus as keyof typeof BOOKING_STATUS]}
                         </span>
                       </div>
                       <span className="text-text-muted text-sm">
@@ -391,13 +401,19 @@ const TasksPage: React.FC = () => {
                       </div>
                     </div>
 
-                    {effectiveStatus === 'success' && (
+                    {(effectiveStatus === 'observed' || (effectiveStatus === 'success' && task.pre_entry_seconds && task.pre_entry_seconds > 0)) ? (
+                      <div className="bg-rog-info/10 border border-rog-info/30 rounded-lg p-3 mb-3">
+                        <p className="text-rog-info font-medium">
+                          Session 觀察完成，未送出查詢或訂票請求。
+                        </p>
+                      </div>
+                    ) : effectiveStatus === 'success' ? (
                       <div className="bg-rog-success/10 border border-rog-success/30 rounded-lg p-3 mb-3">
                         <p className="text-rog-success font-medium">
                           訂票成功！PNR代碼：{cleanPNR(task.success_pnr || task.result)}
                         </p>
                       </div>
-                    )}
+                    ) : null}
 
                     {effectiveStatus === 'failed' && task.error && (
                       <div className="bg-rog-danger/10 border border-rog-danger/30 rounded-lg p-3 mb-3">
@@ -418,6 +434,22 @@ const TasksPage: React.FC = () => {
                     {task.opening_mode && <div className="text-sm text-text-secondary mb-3 space-y-1">
                       <p>{task.in_burst ? '開賣搶票中' : '開賣搶票模式'}：{task.sales_open_at && formatDateTimeWithTimezone(task.sales_open_at)}</p>
                       <p>快速期間 {task.burst_minutes} 分鐘，每輪失敗後等 {task.burst_retry_seconds} 秒</p>
+                      {task.pre_entry_seconds && task.pre_entry_seconds > 0 ? (
+                        <p className="text-rog-info">提前 {task.pre_entry_seconds} 秒建立 Session（只觀察，不送出訂票）</p>
+                      ) : (
+                        <p>開賣時建立訂票 Session</p>
+                      )}
+                      {task.observation_result && (
+                        <p className="text-text-muted">
+                          觀察結果：{String(task.observation_result.outcome || '未知')}
+                          {Boolean(task.observation_result.pre_classification) &&
+                            `；提前頁面 ${String(task.observation_result.pre_classification)}`}
+                          {Boolean(task.observation_result.post_classification) &&
+                            `；開賣頁面 ${String(task.observation_result.post_classification)}`}
+                          {typeof task.observation_result.session_reused === 'boolean' &&
+                            `；Session ${task.observation_result.session_reused ? '相同' : '不同或未取得'}`}
+                        </p>
+                      )}
                       <p>本帳號同時開賣 {task.same_opening_tasks || 0} 筆；系統最多並行 {task.concurrency_limit || 2} 筆</p>
                       {task.warmup_warning && <p className="text-rog-warning">OCR 預熱未完成，執行時將重試載入</p>}
                     </div>}
@@ -431,14 +463,19 @@ const TasksPage: React.FC = () => {
                     </div>}
                     {task.last_attempt && (
                       <p className="text-text-muted text-sm">
-                        上次實際執行：{formatDateTimeWithTimezone(task.last_attempt)}
+                        上次開始執行：{formatDateTimeWithTimezone(task.last_attempt)}
+                      </p>
+                    )}
+                    {task.last_finished && (
+                      <p className="text-text-muted text-sm">
+                        上次完成執行：{formatDateTimeWithTimezone(task.last_finished)}
                       </p>
                     )}
                   </div>
 
                   {/* Action Buttons */}
                   <div className="flex flex-wrap items-center gap-2 lg:ml-4 shrink-0">
-                    {(effectiveStatus === 'pending' || effectiveStatus === 'running' || effectiveStatus === 'waiting') && (
+                    {(effectiveStatus === 'pending' || effectiveStatus === 'running' || effectiveStatus === 'observing' || effectiveStatus === 'waiting') && (
                       <button
                         onClick={() => pauseTaskMutation.mutate(task.id)}
                         disabled={pauseTaskMutation.isLoading}
@@ -472,7 +509,7 @@ const TasksPage: React.FC = () => {
                       </>
                     )}
 
-                    {['pending', 'waiting', 'running', 'pausing', 'paused'].includes(effectiveStatus) && (
+                    {['pending', 'waiting', 'running', 'observing', 'pausing', 'paused'].includes(effectiveStatus) && (
                       <button
                         onClick={() => handleCancelTask(task.id)}
                         disabled={cancelTaskMutation.isLoading}
@@ -484,7 +521,7 @@ const TasksPage: React.FC = () => {
                       </button>
                     )}
 
-                    {(effectiveStatus === 'success' || effectiveStatus === 'failed' || effectiveStatus === 'cancelled' || effectiveStatus === 'expired') && (
+                    {(effectiveStatus === 'success' || effectiveStatus === 'observed' || effectiveStatus === 'failed' || effectiveStatus === 'cancelled' || effectiveStatus === 'expired') && (
                       <button
                         onClick={() => handleRemoveTask(task.id)}
                         disabled={removeTaskMutation.isLoading}

@@ -250,6 +250,10 @@ Examples:
     parser.add_argument('--sales-open-at', help='Opening timestamp with timezone, e.g. 2026-10-01T00:00:00+08:00')
     parser.add_argument('--burst-minutes', type=int, default=2, choices=range(1, 6))
     parser.add_argument('--burst-retry-seconds', type=int, default=5, choices=range(3, 11))
+    parser.add_argument(
+        '--pre-entry-seconds', type=int, default=0, choices=(0, 30, 60),
+        help='GET-only Session observation before opening (0=off, 30 or 60 seconds)',
+    )
     args = parser.parse_args()
     if args.opening_mode and not args.schedule:
         parser.error('--opening-mode requires --schedule')

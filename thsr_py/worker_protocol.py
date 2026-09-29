@@ -12,6 +12,8 @@ class WorkerResult:
     stage: str = 'session'
     uncertain: bool = False
     retry_at: float = 0.0
+    observation: bool = False
+    observation_result: dict = None
 
 class DeferredRequest(Exception):
     pass

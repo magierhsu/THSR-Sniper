@@ -52,6 +52,7 @@ const TaskEditModal: React.FC<TaskEditModalProps> = ({
       sales_open_at: openingLocal(task.sales_open_at),
       burst_minutes: task.burst_minutes || 2,
       burst_retry_seconds: task.burst_retry_seconds || 5,
+      pre_entry_seconds: task.pre_entry_seconds || 0,
       fromStation: task.from_station,
       toStation: task.to_station,
       date: task.date.replace(/\//g, '-'),

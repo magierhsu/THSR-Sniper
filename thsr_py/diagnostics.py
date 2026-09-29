@@ -8,7 +8,11 @@ from datetime import datetime, timezone
 _context = contextvars.ContextVar('booking_diagnostics', default=None)
 FIELDS = frozenset(('stage', 'endpoint', 'method', 'http_status', 'classification',
                     'basis', 'duration_ms', 'request_attempt', 'retry_delay_ms',
-                    'retry_at', 'outcome', 'error_type', 'browser', 'dispatch_delay_ms'))
+                    'retry_at', 'outcome', 'error_type', 'browser', 'dispatch_delay_ms',
+                    'pre_entry_seconds', 'session_age_ms', 'cookie_names_hash',
+                    'queue_token_present', 'session_reused', 'pre_entry_result',
+                    'post_entry_result', 'late_start', 'pre_jsession_present',
+                    'post_jsession_present'))
 
 
 def emit(event, **fields):

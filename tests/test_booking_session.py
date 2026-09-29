@@ -11,6 +11,7 @@ from thsr_py.booking_session import (
     classify_session_response,
     create_booking_session,
     establish_booking_session,
+    has_queue_token,
     resolve_browser_impersonate,
     retry_after_seconds,
 )
@@ -111,6 +112,13 @@ class BookingSessionTests(unittest.TestCase):
             with self.subTest(endpoint=endpoint):
                 classification, _title = classify_session_response(response, endpoint)
                 self.assertEqual(expected, classification)
+
+    def test_queue_token_detection_checks_response_cookie_and_html_names(self):
+        response = FakeResponse(
+            text='<html><body>Waiting Room <input name="queueToken" value="secret"></body></html>',
+            cookies={'queue_cookie': 'secret'},
+        )
+        self.assertTrue(has_queue_token({}, response))
 
     def test_retry_after_supports_seconds_and_http_dates(self):
         seconds_response = FakeResponse(headers={"Retry-After": "45"})

@@ -19,8 +19,16 @@ import fcntl
 import os
 
 from .flows import run as run_booking_flow
-from .opening import OPENING_FIELDS, utc, validate_opening
-from .worker_protocol import WorkerResult, configure, cooldown_until
+from .opening import OPENING_FIELDS, PRE_ENTRY_OPTIONS, utc, validate_opening
+from .booking_session import (
+    create_booking_session,
+    establish_booking_session,
+    cookie_names_hash,
+    has_queue_token,
+    get_jsession_id,
+    SessionHandshakeResult,
+)
+from .worker_protocol import DeferredRequest, WorkerResult, configure, cooldown_until
 from . import diagnostics
 from .schema import (
     MAX_DEPARTURE_TIME_RANGE_MINUTES,
@@ -45,6 +53,14 @@ def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int
 def _booking_worker_ready() -> int:
     """Warm a booking worker and return its process ID."""
     return os.getpid()
+
+
+def _shutdown_executor(executor, *, wait: bool, cancel_futures: bool) -> None:
+    """Support Python versions whose ProcessPoolExecutor lacks cancel_futures."""
+    try:
+        executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+    except TypeError:
+        executor.shutdown(wait=wait)
 
 
 def _initialize_worker(cooldown, ready):
@@ -113,6 +129,197 @@ def _run_booking_flow_worker(args) -> WorkerResult | tuple[str, str, Optional[st
     return result
 
 
+class ObservationCancelled(Exception):
+    """Raised when the scheduler asks a GET-only observation to stop."""
+
+
+def _observation_handshake(session, **kwargs):
+    """Run exactly one GET handshake; observation must not perform retries."""
+    try:
+        return establish_booking_session(
+            session,
+            max_attempts=1,
+            retry_delays=(0.0,),
+            max_elapsed_seconds=30.0,
+            **kwargs,
+        )
+    except DeferredRequest as exc:
+        return SessionHandshakeResult(
+            response=None,
+            jsession_id=None,
+            classification='rate-limited',
+            title='(cooldown)',
+            attempts=0,
+            elapsed_seconds=0.0,
+            browser_impersonate=getattr(
+                session, '_thsr_browser_impersonate', 'firefox'
+            ),
+            error=type(exc).__name__,
+        )
+    except Exception as exc:
+        return SessionHandshakeResult(
+            response=None,
+            jsession_id=None,
+            classification='connection-error',
+            title='(no response)',
+            attempts=0,
+            elapsed_seconds=0.0,
+            browser_impersonate=getattr(
+                session, '_thsr_browser_impersonate', 'firefox'
+            ),
+            error=f'{type(exc).__name__}: {exc}',
+        )
+
+
+def _wait_until_epoch(target: float, control=None) -> bool:
+    """Wait in short intervals and stop promptly when the scheduler shuts down."""
+    late = target < time.time()
+    while True:
+        if control is not None and getattr(control, 'poll', lambda: False)():
+            try:
+                message = control.recv()
+            except (EOFError, OSError):
+                message = None
+            if message == 'shutdown':
+                raise ObservationCancelled()
+        remaining = target - time.time()
+        if remaining <= 0:
+            return late
+        time.sleep(min(remaining, 0.25))
+
+
+def _observation_cookie_snapshot(session, response):
+    """Collect value-free cookie diagnostics without affecting the probe."""
+    try:
+        session_id = get_jsession_id(session, response) if response else None
+    except Exception:
+        session_id = None
+    try:
+        names_hash = cookie_names_hash(session.cookies)
+    except Exception:
+        names_hash = None
+    try:
+        queue_token = has_queue_token(session.cookies, response)
+    except Exception:
+        queue_token = False
+    return session_id, names_hash, queue_token
+
+
+def _run_pre_entry_observation_worker(args) -> WorkerResult:
+    """Observe entry-page/session continuity without OCR, form POSTs, or attempts."""
+    token = diagnostics.begin(
+        getattr(args, '_task_id', None),
+        getattr(args, '_run_id', str(uuid.uuid4())),
+        getattr(args, '_attempt', 0),
+        getattr(args, '_dispatched_at', None),
+    )
+    started = time.monotonic()
+    result = WorkerResult(observation=True)
+    session = None
+    try:
+        opening = getattr(args, '_sales_open_at', None) or getattr(args, 'sales_open_at', None)
+        if isinstance(opening, str):
+            opening = utc(opening)
+        if opening is None:
+            raise ValueError('缺少開賣時間，無法執行 Session 觀察')
+        pre_entry_seconds = int(getattr(args, 'pre_entry_seconds', 0) or 0)
+        if pre_entry_seconds not in PRE_ENTRY_OPTIONS or pre_entry_seconds <= 0:
+            raise ValueError('無效的提前建立 Session 秒數')
+
+        session = create_booking_session()
+        target = opening.timestamp() - pre_entry_seconds
+        control = getattr(args, '_control', None)
+        late_start = _wait_until_epoch(target, control)
+        diagnostics.emit(
+            'pre_entry_started',
+            pre_entry_seconds=pre_entry_seconds,
+            late_start=late_start,
+        )
+        pre = _observation_handshake(session)
+        pre_session_id, pre_names_hash, pre_queue_token = _observation_cookie_snapshot(
+            session, pre.response
+        )
+        pre_queue_token = pre_queue_token or pre.classification == 'queue'
+
+        # Hold the same curl_cffi Session until the exact opening timestamp.
+        late_opening = _wait_until_epoch(opening.timestamp(), control)
+        post = _observation_handshake(session)
+        post_session_id, post_names_hash, post_queue_token = _observation_cookie_snapshot(
+            session, post.response
+        )
+        post_queue_token = post_queue_token or post.classification == 'queue'
+
+        same_session = bool(
+            pre_session_id and post_session_id and
+            pre_session_id == post_session_id
+        )
+        if post.ok and same_session:
+            outcome = 'session-reused'
+        elif post.ok:
+            outcome = 'opening-session-ready'
+        elif post.classification == 'queue' or pre.classification == 'queue':
+            outcome = 'queue-or-waiting'
+        elif post.classification in ('maintenance-or-overloaded', 'rate-limited'):
+            outcome = 'opening-busy'
+        else:
+            outcome = 'handshake-failed'
+
+        observation = {
+            'outcome': outcome,
+            'pre_entry_seconds': pre_entry_seconds,
+            'pre_classification': pre.classification,
+            'post_classification': post.classification,
+            'pre_http_status': pre.response.status_code if pre.response else None,
+            'post_http_status': post.response.status_code if post.response else None,
+            'pre_attempts': pre.attempts,
+            'post_attempts': post.attempts,
+            'session_reused': same_session,
+            'pre_jsession_present': bool(pre_session_id),
+            'post_jsession_present': bool(post_session_id),
+            'pre_cookie_names_hash': pre_names_hash,
+            'post_cookie_names_hash': post_names_hash,
+            'pre_queue_token_present': pre_queue_token,
+            'post_queue_token_present': post_queue_token,
+            'late_start': bool(late_start),
+            'late_opening': bool(late_opening),
+            'elapsed_seconds': round(time.monotonic() - started, 3),
+        }
+        result.observation_result = observation
+        diagnostics.emit(
+            'pre_entry_observed',
+            pre_entry_seconds=pre_entry_seconds,
+            pre_entry_result=pre.classification,
+            post_entry_result=post.classification,
+            session_reused=same_session,
+            late_start=bool(late_start),
+        )
+    except ObservationCancelled:
+        result.error = 'Session 觀察已中斷'
+        result.observation_result = {
+            'outcome': 'interrupted',
+            'elapsed_seconds': round(time.monotonic() - started, 3),
+        }
+        diagnostics.emit('pre_entry_observation_interrupted')
+    except Exception as exc:
+        result.error = f'Session 觀察失敗：{type(exc).__name__}'
+        result.observation_result = {
+            'outcome': 'worker-error',
+            'error_type': type(exc).__name__,
+            'elapsed_seconds': round(time.monotonic() - started, 3),
+        }
+        diagnostics.emit('pre_entry_observation_error', error_type=type(exc).__name__)
+    finally:
+        if session is not None:
+            session.close()
+        diagnostics.finish(
+            token,
+            result.observation_result.get('outcome', 'failed')
+            if result.observation_result else 'failed',
+            cooldown_until(),
+        )
+    return result
+
+
 class BookingStatus(Enum):
     PENDING = "pending"
     RUNNING = "running"
@@ -122,6 +329,8 @@ class BookingStatus(Enum):
     CANCELLED = "cancelled"
     DELETED = "deleted"
     WAITING = "waiting"
+    OBSERVING = "observing"
+    OBSERVED = "observed"
     PAUSING = "pausing"
     PAUSED = "paused"
 
@@ -167,10 +376,13 @@ class BookingTask:
     sales_open_at: Optional[datetime] = None
     burst_minutes: int = 2
     burst_retry_seconds: int = 5
+    # Experimental, GET-only observation window before opening time.
+    pre_entry_seconds: int = 0
     last_finished: Optional[datetime] = None
     retry_not_before: Optional[datetime] = None
     confirmation_pending: bool = False
     needs_confirmation: bool = False
+    observation_result: Optional[Dict[str, Any]] = None
 
     def sales_open(self, now):
         if self.opening_mode:
@@ -240,6 +452,9 @@ class BookingTask:
             personal_id=self.personal_id,
             use_membership=self.use_membership,
             no_ocr=self.no_ocr,
+            opening_mode=self.opening_mode,
+            sales_open_at=self.sales_open_at,
+            pre_entry_seconds=self.pre_entry_seconds,
             stations=False,
             times=False
         )
@@ -277,6 +492,8 @@ class BookingTask:
             "opening_mode": self.opening_mode,
             "burst_minutes": self.burst_minutes,
             "burst_retry_seconds": self.burst_retry_seconds,
+            "pre_entry_seconds": self.pre_entry_seconds,
+            "observation_result": self.observation_result,
             "confirmation_pending": self.confirmation_pending,
             "needs_confirmation": self.needs_confirmation,
             **{key: getattr(self, key).isoformat() if getattr(self, key) else None
@@ -335,9 +552,14 @@ class BookingTask:
                 last_attempt_str += '+00:00'
             task.last_attempt = datetime.fromisoformat(last_attempt_str)
             
-        for key in ('opening_mode', 'burst_minutes', 'burst_retry_seconds', 'confirmation_pending', 'needs_confirmation'):
+        for key in ('opening_mode', 'burst_minutes', 'burst_retry_seconds', 'pre_entry_seconds', 'confirmation_pending', 'needs_confirmation', 'observation_result'):
             if key in data:
                 setattr(task, key, data[key])
+        if task.pre_entry_seconds not in PRE_ENTRY_OPTIONS or not task.opening_mode:
+            # Invalid or legacy experimental values must never activate by accident.
+            task.pre_entry_seconds = 0
+        if not isinstance(task.observation_result, dict):
+            task.observation_result = None
         for key in ('sales_open_at', 'last_finished', 'retry_not_before'):
             setattr(task, key, utc(data.get(key)))
         return task
@@ -405,6 +627,13 @@ class BookingScheduler:
                     changed = True
                 elif task.status == BookingStatus.RUNNING:
                     task.status = BookingStatus.PENDING
+                    changed = True
+                elif task.status == BookingStatus.OBSERVING:
+                    task.status = BookingStatus.WAITING
+                    task.observation_result = {
+                        'outcome': 'interrupted',
+                        'message': '服務重啟，中斷的觀察將重新安排',
+                    }
                     changed = True
                 elif task.status == BookingStatus.PAUSING:
                     task.status = BookingStatus.PAUSED
@@ -663,6 +892,7 @@ class BookingScheduler:
                     self.logger.warning(f"User {user_id} attempted to cancel task {task_id} owned by {task.user_id}")
                     return False
                 task.status = BookingStatus.CANCELLED
+                self._signal_observation_shutdown_locked(task_id)
                 self._save_tasks_locked()
                 self.logger.info(f"Cancelled task: {task_id}")
                 return True
@@ -679,7 +909,7 @@ class BookingScheduler:
 
             if task.status in [BookingStatus.PENDING, BookingStatus.WAITING]:
                 task.status = BookingStatus.PAUSED
-            elif task.status == BookingStatus.RUNNING:
+            elif task.status in [BookingStatus.RUNNING, BookingStatus.OBSERVING]:
                 task.status = BookingStatus.PAUSING
             elif task.status not in [BookingStatus.PAUSING, BookingStatus.PAUSED]:
                 raise TaskStateError(
@@ -688,6 +918,19 @@ class BookingScheduler:
 
             self._save_tasks_locked()
             return task
+
+    def _signal_observation_shutdown_locked(self, task_id: Optional[str] = None) -> None:
+        """Ask observation workers to leave their timed wait without blocking."""
+        for active_id, (parent, _child) in list(self._controls.items()):
+            if task_id is not None and active_id != task_id:
+                continue
+            task = self.tasks.get(active_id)
+            if task is None or task.status not in (BookingStatus.OBSERVING, BookingStatus.PAUSING, BookingStatus.CANCELLED):
+                continue
+            try:
+                parent.send('shutdown')
+            except (EOFError, OSError):
+                pass
 
     def resume_task(self, task_id: str, user_id: Optional[str] = None) -> BookingTask:
         """Resume a paused task and make it immediately eligible to run."""
@@ -712,6 +955,8 @@ class BookingScheduler:
                 else BookingStatus.WAITING
             )
             task.last_attempt = None
+            if task.pre_entry_seconds:
+                task.observation_result = None
             self._save_tasks_locked()
             return task
 
@@ -767,6 +1012,7 @@ class BookingScheduler:
             task.last_attempt = None
             task.success_pnr = None
             task.error_message = None
+            task.observation_result = None
             if hasattr(task, "result"):
                 task.result = None
             self._save_tasks_locked()
@@ -830,7 +1076,7 @@ class BookingScheduler:
         except Exception as exc:
             self.logger.error(f"Failed to initialize booking workers: {exc}")
             if self._booking_executor is not None:
-                self._booking_executor.shutdown(wait=False, cancel_futures=True)
+                _shutdown_executor(self._booking_executor, wait=False, cancel_futures=True)
                 self._booking_executor = None
             self._release_executor_lock()
             return False
@@ -849,6 +1095,8 @@ class BookingScheduler:
     def stop_scheduler(self) -> None:
         """Stop the scheduler."""
         self.running = False
+        with self._state_lock:
+            self._signal_observation_shutdown_locked()
         self._stop_event.set()
         if self.scheduler_thread and self.scheduler_thread.is_alive():
             self.scheduler_thread.join(timeout=30)
@@ -876,7 +1124,7 @@ class BookingScheduler:
                 self._collect_workers()
                 time.sleep(0.1)
             if self._booking_executor is not None:
-                self._booking_executor.shutdown(wait=True, cancel_futures=False)
+                _shutdown_executor(self._booking_executor, wait=True, cancel_futures=False)
                 self._booking_executor = None
             self._release_executor_lock()
     
@@ -887,7 +1135,7 @@ class BookingScheduler:
             if self._inflight or time.monotonic() < self._pool_retry_at:
                 return
             try:
-                self._booking_executor.shutdown(wait=False, cancel_futures=True)
+                _shutdown_executor(self._booking_executor, wait=False, cancel_futures=True)
                 context = multiprocessing.get_context('spawn')
                 self._ready_queue = context.Queue()
                 self._booking_executor = ProcessPoolExecutor(
@@ -911,7 +1159,7 @@ class BookingScheduler:
             if self._cooldown.value != self._persisted_cooldown:
                 if self._save_tasks_locked():
                     self._persisted_cooldown = self._cooldown.value
-            due, reservations = [], 0
+            due, observation_due, reservations = [], [], 0
             changed = False
             for task in self.tasks.values():
                 if task.status not in (BookingStatus.PENDING, BookingStatus.WAITING):
@@ -924,7 +1172,22 @@ class BookingScheduler:
                     task.status = BookingStatus.EXPIRED if task.is_expired() else BookingStatus.FAILED
                     changed = True
                     continue
-                if task.opening_mode and task.sales_open_at and timedelta(0) < task.sales_open_at - now <= timedelta(seconds=30):
+                # Observation tasks occupy a normal worker from their selected
+                # pre-entry window until the opening-time GET completes. They
+                # never enter the booking attempt queue.
+                if task.pre_entry_seconds and task.opening_mode and task.sales_open_at:
+                    observation_start = task.sales_open_at - timedelta(seconds=task.pre_entry_seconds)
+                    if now < observation_start:
+                        changed |= task.status != BookingStatus.WAITING
+                        task.status = BookingStatus.WAITING
+                        continue
+                    changed |= task.status != BookingStatus.PENDING
+                    task.status = BookingStatus.PENDING
+                    if task.id not in self._inflight:
+                        observation_due.append(task)
+                    continue
+                if (task.opening_mode and task.sales_open_at and
+                        timedelta(0) < task.sales_open_at - now <= timedelta(seconds=30)):
                     reservations += 1
                 if not task.sales_open(now):
                     changed |= task.status != BookingStatus.WAITING
@@ -936,6 +1199,10 @@ class BookingScheduler:
                     due.append(task)
             due.sort(key=lambda t: (not t.in_burst(now), t.due_at(now), t.created_at, t.id))
             if self._cooldown.value <= now.timestamp():
+                free = self.max_concurrent_bookings - len(self._inflight)
+                observation_due.sort(key=lambda t: (t.sales_open_at, t.created_at, t.id))
+                observation_selected = observation_due[:max(0, free)]
+                self._execute_observation_tasks(observation_selected, now)
                 free = self.max_concurrent_bookings - len(self._inflight)
                 selected = []
                 for task in due:
@@ -966,8 +1233,9 @@ class BookingScheduler:
         tasks_to_remove = []
         
         for task_id, task in self.tasks.items():
-            if (task.status == BookingStatus.DELETED and 
-                task.last_attempt and task.last_attempt < deleted_cutoff):
+            deleted_reference = task.last_attempt or task.last_finished or task.created_at
+            if (task.status == BookingStatus.DELETED and
+                deleted_reference and deleted_reference < deleted_cutoff):
                 tasks_to_remove.append(task_id)
         
         for task_id in tasks_to_remove:
@@ -995,7 +1263,7 @@ class BookingScheduler:
                     existing_task = self.tasks[task_id]
                     
                     # ALWAYS preserve completed tasks (SUCCESS, CANCELLED, DELETED)
-                    if task.status in [BookingStatus.SUCCESS, BookingStatus.CANCELLED, BookingStatus.DELETED]:
+                    if task.status in [BookingStatus.SUCCESS, BookingStatus.OBSERVED, BookingStatus.CANCELLED, BookingStatus.DELETED]:
                         self.tasks[task_id] = task
                         self.logger.debug(f"Preserved completed task {task_id} status: {task.status.value}")
                     # For other tasks, keep our version if it's more recent or has more attempts
@@ -1048,6 +1316,46 @@ class BookingScheduler:
                     self._save_tasks_locked()
             self._collect_workers()
 
+    def _execute_observation_tasks(self, tasks, dispatch_time):
+        """Dispatch GET-only observation workers without consuming attempts."""
+        if self._booking_executor is None:
+            return
+        with self._state_lock:
+            for task in tasks:
+                if len(self._inflight) >= self.max_concurrent_bookings:
+                    break
+                if (task.status != BookingStatus.PENDING or task.id in self._inflight or
+                        not task.pre_entry_seconds):
+                    continue
+                parent, child = multiprocessing.get_context('spawn').Pipe()
+                args = task.to_args_namespace()
+                args._control = child
+                args._task_id = task.id
+                args._run_id = str(uuid.uuid4())
+                args._attempt = 0
+                args._dispatched_at = time.monotonic()
+                previous_status = task.status
+                task.status = BookingStatus.OBSERVING
+                try:
+                    if not self._save_tasks_locked():
+                        raise RuntimeError('無法保存觀察任務，未派發')
+                    future = self._booking_executor.submit(_run_pre_entry_observation_worker, args)
+                    self.logger.info(
+                        'Dispatch observation task %s (%ss before opening)',
+                        task.id, task.pre_entry_seconds,
+                    )
+                    self._inflight[task.id] = future
+                    self._controls[task.id] = (parent, child)
+                except Exception as exc:
+                    if isinstance(exc, BrokenProcessPool):
+                        self._pool_broken = True
+                    parent.close()
+                    child.close()
+                    task.status = previous_status
+                    task.error_message = str(exc)
+                    self._save_tasks_locked()
+            self._collect_workers()
+
     def _collect_workers(self):
         with self._state_lock:
             for task_id, future in list(self._inflight.items()):
@@ -1072,11 +1380,28 @@ class BookingScheduler:
                 except Exception as exc:
                     if isinstance(exc, BrokenProcessPool):
                         self._pool_broken = True
-                    result = WorkerResult(error=type(exc).__name__, uncertain=task.confirmation_pending)
+                    result = WorkerResult(
+                        error=type(exc).__name__,
+                        uncertain=task.confirmation_pending,
+                        observation=bool(task.pre_entry_seconds),
+                        observation_result={'outcome': 'worker-error', 'error_type': type(exc).__name__}
+                        if task.pre_entry_seconds else None,
+                    )
                 if isinstance(result, WorkerResult):
                     task.last_finished = datetime.now(timezone.utc)
                     task.retry_not_before = datetime.fromtimestamp(result.retry_at, timezone.utc) if result.retry_at else None
-                    if result.pnr:
+                    if result.observation:
+                        task.observation_result = result.observation_result
+                        task.error_message = result.error
+                        observation_outcome = (result.observation_result or {}).get('outcome')
+                        if task.status not in (BookingStatus.CANCELLED, BookingStatus.DELETED):
+                            if observation_outcome == 'interrupted':
+                                task.status = BookingStatus.WAITING
+                            elif observation_outcome == 'worker-error':
+                                task.status = BookingStatus.PAUSED if task.status == BookingStatus.PAUSING else BookingStatus.FAILED
+                            else:
+                                task.status = BookingStatus.PAUSED if task.status == BookingStatus.PAUSING else BookingStatus.OBSERVED
+                    elif result.pnr:
                         task.success_pnr = result.pnr
                         task.status = BookingStatus.SUCCESS
                         task.error_message = None
@@ -1134,6 +1459,16 @@ class BookingScheduler:
             phase = task.status.value
             if task.needs_confirmation:
                 phase = 'needs_confirmation'
+            elif task.status == BookingStatus.OBSERVING:
+                phase = 'observing'
+            elif task.status == BookingStatus.OBSERVED:
+                phase = 'observed'
+            elif (task.status in (BookingStatus.PENDING, BookingStatus.WAITING)
+                  and task.pre_entry_seconds and task.opening_mode and task.sales_open_at
+                  and now < task.sales_open_at):
+                observation_at = task.sales_open_at - timedelta(seconds=task.pre_entry_seconds)
+                phase = 'waiting_observation' if now < observation_at else 'waiting_resource'
+                due = max(observation_at, datetime.fromtimestamp(self._cooldown.value, timezone.utc))
             elif task.status in (BookingStatus.PENDING, BookingStatus.WAITING):
                 phase = 'waiting_opening' if not task.sales_open(now) else ('waiting_resource' if due <= now else 'waiting_retry')
             return {
@@ -1141,7 +1476,7 @@ class BookingScheduler:
                 'in_burst': task.in_burst(now) and task.status in (BookingStatus.PENDING, BookingStatus.RUNNING),
                 'next_attempt_at': due.isoformat() if task.status in (BookingStatus.PENDING, BookingStatus.WAITING) else None,
                 'concurrency_limit': self.max_concurrent_bookings,
-                'same_opening_tasks': sum(1 for t in self.tasks.values() if t.user_id == task.user_id and t.opening_mode and t.sales_open_at == task.sales_open_at and t.status in (BookingStatus.PENDING, BookingStatus.WAITING, BookingStatus.RUNNING)),
+                'same_opening_tasks': sum(1 for t in self.tasks.values() if t.user_id == task.user_id and t.opening_mode and t.sales_open_at == task.sales_open_at and t.status in (BookingStatus.PENDING, BookingStatus.WAITING, BookingStatus.RUNNING, BookingStatus.OBSERVING)),
                 'warmup_warning': any(r['error'] for r in self._warmup_reports),
             }
 
@@ -1255,6 +1590,7 @@ def create_booking_task(
     interval_minutes: int = 5,
     max_attempts: Optional[int] = None,
     no_ocr: bool = False,  # Default to False to enable OCR for automated booking
+    pre_entry_seconds: int = 0,
     **kwargs
 ) -> BookingTask:
     """Create a new booking task with validation for real booking scenarios."""
@@ -1349,10 +1685,16 @@ def create_booking_task(
     if len(personal_id) != 10:
         raise ValueError("Personal ID must be 10 characters long")
     
+    if pre_entry_seconds not in PRE_ENTRY_OPTIONS:
+        raise ValueError("pre_entry_seconds must be 0, 30, or 60")
+    if pre_entry_seconds and not kwargs.get('opening_mode', False):
+        raise ValueError("pre_entry_seconds requires opening_mode")
+
     if 'opening_mode' in kwargs or 'sales_open_at' in kwargs:
         kwargs['sales_open_at'] = validate_opening(
             kwargs.get('opening_mode', False), kwargs.get('sales_open_at'),
-            kwargs.get('burst_minutes', 2), kwargs.get('burst_retry_seconds', 5), date)
+            kwargs.get('burst_minutes', 2), kwargs.get('burst_retry_seconds', 5), date,
+            pre_entry_seconds)
     task = BookingTask(
         id=str(uuid.uuid4()),
         from_station=from_station,
@@ -1375,6 +1717,7 @@ def create_booking_task(
         interval_minutes=interval_minutes,
         max_attempts=max_attempts,
         no_ocr=no_ocr,  # Force no OCR for automated execution
+        pre_entry_seconds=pre_entry_seconds,
         **kwargs
     )
     

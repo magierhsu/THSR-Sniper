@@ -167,6 +167,9 @@ def format_task_summary(task: Dict[str, Any], detailed: bool = False) -> None:
     
     print(f"Interval: {task['interval_minutes']} minutes")
     print(f"Attempts: {task['attempts']}")
+
+    if task.get('pre_entry_seconds'):
+        print(f"Pre-entry observation: {task['pre_entry_seconds']} seconds (GET only)")
     
     if task.get('last_attempt'):
         last_attempt = datetime.fromisoformat(task['last_attempt'].replace('Z', '+00:00'))
@@ -174,6 +177,15 @@ def format_task_summary(task: Dict[str, Any], detailed: bool = False) -> None:
     
     if task.get('success_pnr'):
         print(f"✓ SUCCESS - PNR: {task['success_pnr']}")
+    elif task.get('observation_result'):
+        observation = task['observation_result']
+        print(
+            "Observation: "
+            f"{observation.get('outcome', 'unknown')} "
+            f"(pre={observation.get('pre_classification', '-')}, "
+            f"opening={observation.get('post_classification', '-')}, "
+            f"same_session={observation.get('session_reused', False)})"
+        )
     elif task.get('error_message'):
         print(f"× Error: {task['error_message'][:100]}...")
     
@@ -333,6 +345,7 @@ def schedule_booking_via_api(args) -> None:
             sales_open_at=getattr(args, 'sales_open_at', None),
             burst_minutes=getattr(args, 'burst_minutes', 2),
             burst_retry_seconds=getattr(args, 'burst_retry_seconds', 5),
+            pre_entry_seconds=getattr(args, 'pre_entry_seconds', 0),
             interval_minutes=getattr(args, 'interval', 5),
             max_attempts=getattr(args, 'max_attempts', None),
             time=getattr(args, 'time', None),

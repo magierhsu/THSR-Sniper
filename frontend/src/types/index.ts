@@ -4,7 +4,16 @@ export interface OpeningSettings {
   burst_minutes?: number;
   burst_retry_seconds?: number;
 }
-export interface ExecutionInfo extends OpeningSettings {
+
+// Pre-entry is an experimental task-only setting. It is deliberately kept
+// separate from OpeningSettings so it is not persisted in booking preferences.
+export type PreEntrySeconds = 0 | 30 | 60;
+
+export interface OpeningTaskSettings extends OpeningSettings {
+  pre_entry_seconds?: PreEntrySeconds;
+}
+
+export interface ExecutionInfo extends OpeningTaskSettings {
   needs_confirmation?: boolean;
   execution_phase?: string;
   in_burst?: boolean;
@@ -123,7 +132,7 @@ export interface BookingRequest {
   no_ocr?: boolean;
 }
 
-export interface ScheduledBookingRequest extends BookingRequest, OpeningSettings {
+export interface ScheduledBookingRequest extends BookingRequest, OpeningTaskSettings {
   interval_minutes: number;
   max_attempts?: number;
 }
@@ -149,6 +158,8 @@ export interface TaskStatusResponse extends ExecutionInfo {
   last_attempt?: string;
   success_pnr?: string;
   error_message?: string;
+  observation_result?: Record<string, unknown> | null;
+  last_finished?: string;
   created_at: string;
   time?: number;
   time_range_minutes: number;
@@ -167,7 +178,7 @@ export interface TaskStatusResponse extends ExecutionInfo {
 
 export interface BookingTask extends ExecutionInfo {
   id: string;
-  status: 'pending' | 'running' | 'pausing' | 'paused' | 'success' | 'failed' | 'cancelled' | 'expired' | 'waiting';
+  status: 'pending' | 'running' | 'observing' | 'observed' | 'pausing' | 'paused' | 'success' | 'failed' | 'cancelled' | 'expired' | 'waiting';
   from_station: number;
   to_station: number;
   date: string;
@@ -194,6 +205,8 @@ export interface BookingTask extends ExecutionInfo {
   result?: string;
   success_pnr?: string;
   error?: string;
+  observation_result?: Record<string, unknown> | null;
+  last_finished?: string;
 }
 
 export interface SchedulerStatus {
@@ -220,11 +233,12 @@ export interface BookingStats {
   status_breakdown: Record<string, number>;
   success_rate: number;
   completed_tasks: number;
+  observed_tasks?: number;
   active_tasks: number;
 }
 
 // Form Types
-export interface BookingFormData extends OpeningSettings {
+export interface BookingFormData extends OpeningTaskSettings {
   fromStation: number;
   toStation: number;
   date: string;
@@ -286,6 +300,8 @@ export const BOOKING_STATUS = {
   waiting: '尚未開票',
   pending: '等待下次執行',
   running: '正在執行',
+  observing: '觀察 Session 中',
+  observed: '觀察完成',
   pausing: '本次完成後暫停',
   paused: '已暫停',
   success: '成功',
