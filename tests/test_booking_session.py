@@ -54,9 +54,11 @@ class FakeSession:
         self.cookies = FakeCookies(cookies)
         self._thsr_browser_impersonate = browser
         self.calls = 0
+        self.timeouts = []
 
     def get(self, _url, timeout, allow_redirects):
         self.calls += 1
+        self.timeouts.append(timeout)
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
@@ -161,6 +163,66 @@ class BookingSessionTests(unittest.TestCase):
         self.assertEqual([7.0], sleeps)
         self.assertIn("JSESSIONID", " ".join(logs))
         self.assertNotIn("secret-value", " ".join(logs))
+
+    def test_deadline_caps_request_timeout(self):
+        session = FakeSession([FakeResponse(cookies={"JSESSIONID": "secret"})])
+        result = establish_booking_session(
+            session,
+            max_attempts=1,
+            retry_delays=(0,),
+            deadline_epoch=105.0,
+            wall_time=lambda: 100.0,
+            monotonic=lambda: 0.0,
+            logger=lambda _message: None,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual((5.0, 5.0), session.timeouts[0])
+
+    def test_deadline_rejects_response_that_finishes_after_t0(self):
+        now = [100.0]
+
+        class SlowSession(FakeSession):
+            def get(self, _url, timeout, allow_redirects):
+                self.calls += 1
+                self.timeouts.append(timeout)
+                now[0] = 105.001
+                return FakeResponse(cookies={"JSESSIONID": "secret"})
+
+        session = SlowSession([])
+        result = establish_booking_session(
+            session,
+            max_attempts=1,
+            retry_delays=(0,),
+            deadline_epoch=105.0,
+            wall_time=lambda: now[0],
+            monotonic=lambda: 0.0,
+            logger=lambda _message: None,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual("deadline-exceeded", result.classification)
+
+    def test_retry_after_cannot_cross_deadline(self):
+        session = FakeSession([
+            FakeResponse(status_code=429, headers={"Retry-After": "10"}),
+        ])
+        sleeps = []
+        result = establish_booking_session(
+            session,
+            max_attempts=2,
+            retry_delays=(0, 0),
+            deadline_epoch=105.0,
+            wall_time=lambda: 100.0,
+            monotonic=lambda: 0.0,
+            sleep=sleeps.append,
+            logger=lambda _message: None,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual("deadline-exceeded", result.classification)
+        self.assertEqual(1, session.calls)
+        self.assertEqual([], sleeps)
 
     def test_booking_page_without_jsessionid_is_rejected(self):
         result = establish_booking_session(

@@ -4,7 +4,7 @@ from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from thsr_py.booking_session import SessionHandshakeResult
 from thsr_py.scheduler import (
@@ -112,6 +112,42 @@ class PreEntryObservationTests(unittest.TestCase):
         self.assertTrue(result.observation_result['session_reused'])
         self.assertIsNone(result.pnr)
         self.assertTrue(session.closed)
+
+    def test_t0_fallback_uses_fresh_session_when_pre_entry_misses_deadline(self):
+        pre_session = FakeSession()
+        t0_session = FakeSession()
+        handshakes = [
+            SessionHandshakeResult(
+                response=None, jsession_id=None, classification='deadline-exceeded',
+                title='(session deadline)', attempts=1, elapsed_seconds=30.0,
+                browser_impersonate='firefox', error='deadline',
+            ),
+            SessionHandshakeResult(
+                response=SimpleNamespace(status_code=200, cookies=t0_session.cookies),
+                jsession_id='t0', classification='booking-page', title='entry',
+                attempts=1, elapsed_seconds=0.01, browser_impersonate='firefox',
+            ),
+        ]
+        args = SimpleNamespace(
+            _task_id='fallback', _run_id='run', _attempt=0,
+            _dispatched_at=None, sales_open_at=OPENING, pre_entry_seconds=60,
+        )
+        handshake = Mock(side_effect=handshakes)
+        with patch('thsr_py.scheduler.create_booking_session',
+                   side_effect=[pre_session, t0_session]) as create_session, \
+             patch('thsr_py.scheduler._observation_handshake', handshake), \
+             patch('thsr_py.scheduler._wait_until_epoch', return_value=False):
+            result = _run_pre_entry_observation_worker(args)
+
+        self.assertEqual('opening-session-ready', result.observation_result['outcome'])
+        self.assertTrue(result.observation_result['t0_fallback_used'])
+        self.assertFalse(result.observation_result['client_session_reused'])
+        self.assertTrue(result.observation_result['t0_session_ready'])
+        self.assertEqual(2, create_session.call_count)
+        self.assertEqual(OPENING.timestamp(), handshake.call_args_list[0].kwargs['deadline_epoch'])
+        self.assertNotIn('deadline_epoch', handshake.call_args_list[1].kwargs)
+        self.assertTrue(pre_session.closed)
+        self.assertTrue(t0_session.closed)
 
     def test_queue_token_takes_precedence_over_busy_page_classification(self):
         session = FakeSession()

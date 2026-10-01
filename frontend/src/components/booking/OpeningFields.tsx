@@ -61,7 +61,7 @@ export default function OpeningFields({ register, watch, errors, setValue }: {
           </select>
           {preEntrySeconds > 0 && (
             <span className="text-text-muted text-xs mt-1 block">
-              測試模式只會取得並觀察 Session，不會送出查詢、選車或訂票請求。
+              只觀察 Session；不會送出查詢、選車或訂票請求。正式訂票會在開賣時另外建立自己的 Session；測試時請勿占滿兩個共用 worker。
             </span>
           )}
         </label>

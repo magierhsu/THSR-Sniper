@@ -12,7 +12,9 @@ FIELDS = frozenset(('stage', 'endpoint', 'method', 'http_status', 'classificatio
                     'pre_entry_seconds', 'session_age_ms', 'cookie_names_hash',
                     'queue_token_present', 'session_reused', 'pre_entry_result',
                     'post_entry_result', 'late_start', 'pre_jsession_present',
-                    'post_jsession_present'))
+                    'post_jsession_present', 'client_session_reused',
+                    'jsession_unchanged', 't0_session_ready', 't0_fallback_used',
+                    'late_opening', 'post_request_late', 'fallback_reason'))
 
 
 def emit(event, **fields):

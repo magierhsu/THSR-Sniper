@@ -36,8 +36,15 @@ from this new diagnostic stream. Diagnostic write failures do not abort booking.
 An opening-mode task may set `pre_entry_seconds` to `30` or `60` (the default
 `0` disables it). The scheduler dispatches a dedicated worker at that offset,
 which keeps one curl session alive, performs one GET before opening and one GET
-at the configured opening time, then closes the session. It never runs OCR,
+at the configured opening time, then closes the session. The pre-entry GET has
+a hard deadline at T0. If it has not completed, the worker discards that
+session and establishes a fresh session for the T0 GET. It never runs OCR,
 sends a search/selection/confirmation POST, or increments `attempts`.
+
+This is an observation task, not a booking warm-up. A normal booking worker
+always creates and handshakes its own fresh session at T0 before it can send
+the query, selection, or confirmation requests. A session held by an
+observation worker is never passed to the booking worker.
 
 The task ends in `observed` (or `paused` if it was paused while observing) and
 exposes a value-free `observation_result` with both response classifications,
@@ -48,6 +55,11 @@ was acquired. Cookie names are represented only by short hashes; cookie and
 token values are never persisted. A worker exception is recorded as `failed`,
 while an intentional service stop records `interrupted` and returns the task
 to `waiting`. If all workers are occupied until opening, a waiting experiment
-is recorded as `window-missed` without sending a late request, so it cannot
-delay real booking tasks. A service restart also converts an interrupted
+is recorded as `window-missed` without sending a late request; an already
+running observation can still use a worker until its T0 GET completes, so do
+not fill both shared workers with observations when a real booking is due.
+A service restart also converts an interrupted
 `observing` task back to `waiting` so the observation can be scheduled again.
+The result distinguishes in-process client reuse from an unchanged
+`JSESSIONID`; a changed server cookie does not mean that the client created a
+second session.

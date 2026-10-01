@@ -235,7 +235,9 @@ def _run_pre_entry_observation_worker(args) -> WorkerResult:
             pre_entry_seconds=pre_entry_seconds,
             late_start=late_start,
         )
-        pre = _observation_handshake(session)
+        # The first probe is useful only if it finishes before T0. Cap its
+        # network timeout and retry budget at the opening timestamp.
+        pre = _observation_handshake(session, deadline_epoch=opening.timestamp())
         pre_session_id, pre_names_hash, pre_queue_token = _observation_cookie_snapshot(
             session, pre.response
         )
@@ -243,6 +245,15 @@ def _run_pre_entry_observation_worker(args) -> WorkerResult:
 
         # Hold the same curl_cffi Session until the exact opening timestamp.
         late_opening = _wait_until_epoch(opening.timestamp(), control)
+        t0_fallback_used = not pre.ok or late_opening
+        if t0_fallback_used:
+            diagnostics.emit(
+                't0_session_fallback',
+                fallback_reason='pre-entry-incomplete' if not pre.ok else 'pre-entry-late',
+            )
+            session.close()
+            session = create_booking_session()
+        post_started_at = time.time()
         post = _observation_handshake(session)
         post_session_id, post_names_hash, post_queue_token = _observation_cookie_snapshot(
             session, post.response
@@ -253,6 +264,7 @@ def _run_pre_entry_observation_worker(args) -> WorkerResult:
             pre_session_id and post_session_id and
             pre_session_id == post_session_id
         )
+        client_session_reused = not t0_fallback_used
         if post.ok and same_session:
             outcome = 'session-reused'
         elif post.ok:
@@ -275,6 +287,10 @@ def _run_pre_entry_observation_worker(args) -> WorkerResult:
             'pre_attempts': pre.attempts,
             'post_attempts': post.attempts,
             'session_reused': same_session,
+            'client_session_reused': client_session_reused,
+            'jsession_unchanged': same_session,
+            't0_session_ready': post.ok,
+            't0_fallback_used': t0_fallback_used,
             'pre_jsession_present': bool(pre_session_id),
             'post_jsession_present': bool(post_session_id),
             'pre_cookie_names_hash': pre_names_hash,
@@ -283,6 +299,7 @@ def _run_pre_entry_observation_worker(args) -> WorkerResult:
             'post_queue_token_present': post_queue_token,
             'late_start': bool(late_start),
             'late_opening': bool(late_opening),
+            'post_request_late': bool(post_started_at > opening.timestamp()),
             'elapsed_seconds': round(time.monotonic() - started, 3),
         }
         result.observation_result = observation
@@ -292,7 +309,10 @@ def _run_pre_entry_observation_worker(args) -> WorkerResult:
             pre_entry_result=pre.classification,
             post_entry_result=post.classification,
             session_reused=same_session,
+            client_session_reused=client_session_reused,
+            t0_fallback_used=t0_fallback_used,
             late_start=bool(late_start),
+            late_opening=bool(late_opening),
         )
     except ObservationCancelled:
         result.error = 'Session 觀察已中斷'

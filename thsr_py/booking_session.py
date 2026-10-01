@@ -306,12 +306,18 @@ def establish_booking_session(
     retry_delays: Sequence[float] = SESSION_RETRY_DELAYS_SECONDS,
     max_elapsed_seconds: float = SESSION_MAX_ELAPSED_SECONDS,
     request_timeout: Tuple[float, float] = SESSION_REQUEST_TIMEOUT,
+    deadline_epoch: Optional[float] = None,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     wall_time: Callable[[], float] = time.time,
     logger: Callable[[str], None] = print,
 ) -> SessionHandshakeResult:
-    """Establish a booking session with bounded, server-aware retries."""
+    """Establish a booking session with bounded, server-aware retries.
+
+    ``deadline_epoch`` is an absolute wall-clock deadline for probes that must
+    finish before a known opening time. It caps both retry sleeps and the
+    underlying HTTP timeout so a slow response cannot silently run past T0.
+    """
     started_at = monotonic()
     browser = getattr(
         session, "_thsr_browser_impersonate", DEFAULT_BROWSER_IMPERSONATE
@@ -322,6 +328,27 @@ def establish_booking_session(
     last_error = "No response received"
     attempts = 0
     server_delay = 0.0
+
+    def deadline_timeout() -> Optional[Tuple[float, float]]:
+        if deadline_epoch is None:
+            return request_timeout
+        remaining = deadline_epoch - wall_time()
+        if remaining <= 0:
+            return None
+        return tuple(
+            max(0.001, min(float(value), remaining))
+            for value in request_timeout
+        )
+
+    def mark_deadline_exceeded() -> None:
+        nonlocal last_classification, last_title, last_error
+        last_classification = "deadline-exceeded"
+        last_title = "(session deadline)"
+        last_error = "Session handshake deadline reached"
+        diagnostics.emit(
+            'session_deadline_exceeded',
+            retry_at=deadline_epoch,
+        )
 
     for attempt_index in range(max_attempts):
         configured_delay = (
@@ -337,6 +364,9 @@ def establish_booking_session(
                 diagnostics.emit('session_budget_exhausted', classification=last_classification,
                                  retry_delay_ms=delay * 1000)
                 break
+            if deadline_epoch is not None and wall_time() + delay >= deadline_epoch:
+                mark_deadline_exceeded()
+                break
             diagnostics.emit('session_retry', request_attempt=attempt_index + 1,
                              classification=last_classification, retry_delay_ms=delay * 1000)
             logger(
@@ -349,14 +379,22 @@ def establish_booking_session(
             last_error = "Session retry budget exhausted"
             break
 
+        bounded_timeout = deadline_timeout()
+        if bounded_timeout is None:
+            mark_deadline_exceeded()
+            break
+
         attempts += 1
         try:
             response = session.get(
                 BOOKING_PAGE_URL,
-                timeout=request_timeout,
+                timeout=bounded_timeout,
                 allow_redirects=True,
             )
             last_response = response
+            if deadline_epoch is not None and wall_time() >= deadline_epoch:
+                mark_deadline_exceeded()
+                break
             classification, title = classify_session_response(response)
             jsession_id = get_jsession_id(session, response)
             if classification == "booking-page" and not jsession_id:
@@ -403,6 +441,9 @@ def establish_booking_session(
         except requests.exceptions.RequestException as exc:
             diagnostics.emit('session_exception', request_attempt=attempts,
                              error_type=type(exc).__name__)
+            if deadline_epoch is not None and wall_time() >= deadline_epoch:
+                mark_deadline_exceeded()
+                break
             last_classification = "connection-error"
             last_title = "(no response)"
             last_error = f"{type(exc).__name__}: {exc}"
